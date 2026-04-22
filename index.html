@@ -64,8 +64,23 @@
       handLostAt: 0,
       errorTitle: "",
       errorDetail: "",
+      inputMode: "hand",
+      mouseButton: { x: 0, y: 0, w: 0, h: 0 },
       table: null,
       rally: 0,
+      feedback: {
+        text: "",
+        startedAt: -Infinity,
+        x: 0,
+        z: 0.11
+      },
+      stats: {
+        playerHits: 0,
+        botHits: 0,
+        perfectHits: 0,
+        longestRally: 0,
+        pointsPlayed: 0
+      },
       score: { player: 0, bot: 0 },
       server: "player",
       serveStartedAt: 0,
@@ -99,6 +114,11 @@
         radius: 58,
         pulseStartedAt: -Infinity
       },
+      mouse: {
+        active: false,
+        x: 0,
+        z: 0.08
+      },
       bot: {
         x: 0,
         baseZ: 0.92,
@@ -125,6 +145,7 @@
     const ease = (t) => t * t * (3 - 2 * t);
     const randomRange = (min, max) => min + Math.random() * (max - min);
     const handIsFresh = (now) => gameState.handReady && now - gameState.handSeenAt < 650;
+    const controlIsReady = (now) => gameState.inputMode === "mouse" || handIsFresh(now);
     const frameLerp = (factor, dt) => 1 - Math.pow(1 - factor, dt * 60);
 
     function triggerScreenShake(power = 1) {
@@ -423,8 +444,10 @@
       const palmY = (wrist.y + middleBase.y + indexBase.y + pinkyBase.y) * 0.25;
       const mirroredX = 1 - palmX;
 
-      gameState.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.82, 0.82);
-      gameState.player.targetZ = clamp(0.045 + (1 - palmY) * 0.19, 0.035, 0.235);
+      if (gameState.inputMode === "hand") {
+        gameState.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.82, 0.82);
+        gameState.player.targetZ = clamp(0.045 + (1 - palmY) * 0.19, 0.035, 0.235);
+      }
       gameState.handReady = true;
       gameState.handSeenAt = now;
     }
@@ -510,8 +533,8 @@
         const paddlePoint = tablePoint(gameState.player.x, gameState.player.z);
         const distance = Math.hypot(ballPoint.x - paddlePoint.x, ballPoint.y - paddlePoint.y);
 
-        if (distance <= 80 && gameState.handReady && now - gameState.handSeenAt < 250) {
-          playerHit(pose);
+        if (distance <= 80 && controlIsReady(performance.now())) {
+          playerHit(pose, distance);
           return;
         } else if (pose.z < 0.055) {
           ball.hitWindowOpen = false;
@@ -548,6 +571,8 @@
       gameState.scorePulseSide = winner;
       gameState.scorePulseStartedAt = performance.now();
       gameState.bot.hitAvailable = false;
+      gameState.stats.pointsPlayed += 1;
+      gameState.stats.longestRally = Math.max(gameState.stats.longestRally, gameState.rally);
       playPointSound();
 
       gameState.ball.active = false;
@@ -592,7 +617,7 @@
       gameState.ball.toX = player.x;
       gameState.ball.toZ = player.z;
 
-      if (now - gameState.serveStartedAt < 250 || !gameState.handReady || now - gameState.handSeenAt > 300) {
+      if (now - gameState.serveStartedAt < 250 || !controlIsReady(performance.now())) {
         return;
       }
 
@@ -646,9 +671,20 @@
       }
     }
 
-    function playerHit(pose) {
+    function showHitFeedback(text, pose) {
+      gameState.feedback = {
+        text,
+        startedAt: performance.now(),
+        x: pose.x,
+        z: Math.max(0.09, pose.z)
+      };
+    }
+
+    function playerHit(pose, distance = 80) {
       const player = gameState.player;
       const handSpeed = Math.hypot(player.vx * 0.8, player.vz * 2.4);
+      const quality = distance < 30 ? "PERFECT" : distance < 58 ? "NICE" : "REACH";
+      const qualityBoost = quality === "PERFECT" ? 0.24 : quality === "NICE" ? 0.1 : -0.04;
       const swipe = clamp(player.vx * 0.09, -0.55, 0.55);
       const depthDrive = clamp(player.vz * 0.08, -0.04, 0.08);
       const targetX = pose.x + swipe + player.x * 0.18;
@@ -656,8 +692,14 @@
       const spin = clamp(player.vz * 0.8 + handSpeed * 0.06, -1, 1.25);
 
       gameState.rally += 1;
+      gameState.stats.playerHits += 1;
+      gameState.stats.longestRally = Math.max(gameState.stats.longestRally, gameState.rally);
+      if (quality === "PERFECT") {
+        gameState.stats.perfectHits += 1;
+      }
       gameState.hitFlash = 1;
       player.pulseStartedAt = performance.now();
+      showHitFeedback(quality, pose);
       playBallHitSound();
       triggerScreenShake(handSpeed);
       launchBall({
@@ -666,7 +708,7 @@
         toX: targetX,
         toZ: targetZ,
         direction: 1,
-        power: clamp(handSpeed, 0, 1.8),
+        power: clamp(handSpeed + qualityBoost, 0, 1.8),
         spin,
         sideSpin: clamp(player.vx * 0.1, -0.7, 0.7)
       });
@@ -680,6 +722,8 @@
       const targetZ = -0.08 - Math.random() * 0.035;
 
       gameState.rally += 1;
+      gameState.stats.botHits += 1;
+      gameState.stats.longestRally = Math.max(gameState.stats.longestRally, gameState.rally);
       bot.flash = 1;
       bot.swingStartedAt = performance.now();
       bot.pulseStartedAt = bot.swingStartedAt;
@@ -714,6 +758,61 @@
       resetMatch(0);
     }
 
+    function beginMouseMode() {
+      gameState.inputMode = "mouse";
+      gameState.mode = "playing";
+      gameState.phase = "player-serve";
+      gameState.pausedForHand = false;
+      gameState.message = "";
+      resetMatch(0);
+    }
+
+    function screenToPlayerTarget(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      const z = clamp((gameState.table.bottomY - y) / (gameState.table.height * 0.82), 0.035, 0.235);
+      const xNorm = clamp((x - gameState.table.cx) / (tableWidthAt(z) * 0.5), -0.82, 0.82);
+      return { x: xNorm, z };
+    }
+
+    function updateMouseTarget(event) {
+      if (!gameState.table) {
+        return;
+      }
+
+      const target = screenToPlayerTarget(event.clientX, event.clientY);
+      gameState.mouse.active = true;
+      gameState.mouse.x = target.x;
+      gameState.mouse.z = target.z;
+
+      if (gameState.inputMode === "mouse") {
+        gameState.player.targetX = target.x;
+        gameState.player.targetZ = target.z;
+      }
+    }
+
+    function mouseServe() {
+      if (gameState.inputMode !== "mouse" || gameState.phase !== "player-serve") {
+        return;
+      }
+
+      gameState.rally = 0;
+      gameState.hitFlash = 1;
+      gameState.player.pulseStartedAt = performance.now();
+      playBallHitSound();
+      launchBall({
+        fromX: gameState.player.x,
+        fromZ: gameState.player.z,
+        toX: clamp(gameState.player.x * 0.55, -0.68, 0.68),
+        toZ: 1.06,
+        direction: 1,
+        power: 0.62,
+        spin: 0.35,
+        sideSpin: clamp(gameState.player.vx * 0.08, -0.35, 0.35)
+      });
+    }
+
     function update(now) {
       const dt = Math.min((now - gameState.time) / 1000, 1 / 30);
       gameState.time = now;
@@ -726,6 +825,11 @@
       detectHand(now);
 
       if (gameState.mode === "intro") {
+        if (gameState.inputMode === "mouse") {
+          beginMatch();
+          return;
+        }
+
         if (handIsFresh(now)) {
           if (gameState.phase !== "countdown") {
             beginCountdown(now);
@@ -744,7 +848,7 @@
         return;
       }
 
-      if (activeGameplayPhase() && !handIsFresh(now)) {
+      if (activeGameplayPhase() && !controlIsReady(now)) {
         gameState.pausedForHand = true;
         if (!gameState.handLostAt) {
           gameState.handLostAt = now;
@@ -986,6 +1090,46 @@
       ctx.restore();
     }
 
+    function drawLandingMarker() {
+      if (!gameState.ball?.active || gameState.phase !== "rally") {
+        return;
+      }
+
+      const markerZ = clamp(gameState.ball.toZ, 0.08, 0.92);
+      const marker = tablePoint(gameState.ball.toX, markerZ);
+      const pulse = 0.5 + Math.sin(performance.now() * 0.012) * 0.5;
+
+      ctx.save();
+      ctx.globalAlpha = 0.22 + pulse * 0.1;
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(marker.x, marker.y, 18, 7, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawHitFeedback() {
+      const elapsed = performance.now() - gameState.feedback.startedAt;
+      if (!gameState.feedback.text || elapsed < 0 || elapsed > 520) {
+        return;
+      }
+
+      const point = tablePoint(gameState.feedback.x, gameState.feedback.z);
+      const alpha = 1 - elapsed / 520;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = gameState.feedback.text === "PERFECT" ? "#34d178" : "#ffffff";
+      ctx.shadowColor = "rgba(0, 0, 0, 0.48)";
+      ctx.shadowBlur = 8;
+      ctx.font = "900 20px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText(gameState.feedback.text, point.x, point.y - 44 - elapsed * 0.035);
+      ctx.restore();
+    }
+
     function drawHud() {
       ctx.save();
       ctx.textAlign = "center";
@@ -1012,10 +1156,12 @@
       ctx.font = "800 13px Nunito, Arial, Helvetica, sans-serif";
       if (gameState.pausedForHand) {
         // Pause overlay owns the hand-lost message.
-      } else if (!gameState.handReady && gameState.mode === "playing") {
+      } else if (gameState.inputMode === "hand" && !gameState.handReady && gameState.mode === "playing") {
         ctx.fillText("Show your right hand to control the paddle", cx, 112);
-      } else if (gameState.handReady && performance.now() - gameState.handSeenAt > 700) {
+      } else if (gameState.inputMode === "hand" && gameState.handReady && performance.now() - gameState.handSeenAt > 700) {
         ctx.fillText("Right hand lost", cx, 112);
+      } else if (gameState.inputMode === "mouse" && gameState.phase === "player-serve") {
+        ctx.fillText("Move mouse to aim • click to serve", cx, 112);
       } else if (gameState.phase === "player-serve") {
         ctx.fillText("Swing forward to serve", cx, 112);
       } else if (gameState.phase === "bot-serve") {
@@ -1023,7 +1169,7 @@
       }
 
       ctx.globalAlpha = 0.7;
-      ctx.fillText(`Rally ${gameState.rally}`, cx, window.innerHeight - 32);
+      ctx.fillText(`Rally ${gameState.rally}  •  Best ${gameState.stats.longestRally}`, cx, window.innerHeight - 32);
       ctx.restore();
     }
 
@@ -1111,6 +1257,9 @@
       ctx.fillStyle = "#242a33";
       ctx.font = "900 24px Nunito, Arial, Helvetica, sans-serif";
       ctx.fillText(`${gameState.score.player} - ${gameState.score.bot}`, cx, cardY + 124);
+      ctx.fillStyle = "rgba(36, 42, 51, 0.72)";
+      ctx.font = "800 15px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText(`Best rally ${gameState.stats.longestRally}  •  Perfect hits ${gameState.stats.perfectHits}`, cx, cardY + 154);
 
       ctx.fillStyle = "#2f72d2";
       roundedRect(buttonX, buttonY, buttonW, buttonH, 24);
@@ -1125,6 +1274,16 @@
       gameState.mode = "playing";
       gameState.simTime = now;
       gameState.score = { player: 0, bot: 0 };
+      gameState.rally = 0;
+      gameState.feedback.text = "";
+      gameState.feedback.startedAt = -Infinity;
+      gameState.stats = {
+        playerHits: 0,
+        botHits: 0,
+        perfectHits: 0,
+        longestRally: 0,
+        pointsPlayed: 0
+      };
       gameState.server = "player";
       gameState.pendingGameWinner = null;
       gameState.winner = null;
@@ -1143,6 +1302,34 @@
 
     function handleInput(type, event) {
       ensureAudio();
+      let pointerX = 0;
+      let pointerY = 0;
+
+      if (type === "key" && (event.key === "m" || event.key === "M")) {
+        gameState.inputMode = gameState.inputMode === "mouse" ? "hand" : "mouse";
+        if (gameState.inputMode === "mouse" && gameState.mode !== "playing") {
+          beginMouseMode();
+        }
+        return;
+      }
+
+      if (type === "pointer") {
+        updateMouseTarget(event);
+        const button = gameState.mouseButton;
+        const rect = canvas.getBoundingClientRect();
+        pointerX = event.clientX - rect.left;
+        pointerY = event.clientY - rect.top;
+        const mouseButtonHit = pointerX >= button.x && pointerX <= button.x + button.w && pointerY >= button.y && pointerY <= button.y + button.h;
+
+        if ((gameState.mode === "intro" || gameState.mode === "error" || gameState.mode === "loading") && mouseButtonHit) {
+          beginMouseMode();
+          return;
+        }
+
+        if (gameState.inputMode === "mouse") {
+          mouseServe();
+        }
+      }
 
       if (gameState.phase !== "game-over") {
         return;
@@ -1156,11 +1343,8 @@
         return;
       }
 
-      const rect = canvas.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
       const button = gameState.playAgainButton;
-      const insideButton = x >= button.x && x <= button.x + button.w && y >= button.y && y <= button.y + button.h;
+      const insideButton = pointerX >= button.x && pointerX <= button.x + button.w && pointerY >= button.y && pointerY <= button.y + button.h;
 
       if (insideButton) {
         resetMatch(0);
@@ -1171,8 +1355,33 @@
       handleInput("pointer", event);
     }
 
+    function handlePointerMove(event) {
+      updateMouseTarget(event);
+    }
+
     function handleKeyDown(event) {
       handleInput("key", event);
+    }
+
+    function drawMouseModeButton(cx, y) {
+      const w = 226;
+      const h = 44;
+      const x = cx - w * 0.5;
+
+      gameState.mouseButton = { x, y, w, h };
+      ctx.save();
+      ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+      roundedRect(x, y, w, h, 22);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.28)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = "#ffffff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = "900 16px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText("Play with Mouse", cx, y + h * 0.5 + 1);
+      ctx.restore();
     }
 
     function drawStartup() {
@@ -1210,6 +1419,7 @@
         ctx.fillStyle = "rgba(255, 255, 255, 0.72)";
         ctx.font = "800 15px Nunito, Arial, Helvetica, sans-serif";
         ctx.fillText(gameState.errorDetail || "Allow camera access and reload this page.", cx, cy + 58);
+        drawMouseModeButton(cx, cy + 94);
         ctx.restore();
         return;
       }
@@ -1253,6 +1463,7 @@
         ctx.fillText("Waiting for hand", cx, cy + 84);
       }
 
+      drawMouseModeButton(cx, cy + 164);
       ctx.restore();
     }
 
@@ -1284,9 +1495,11 @@
       ctx.save();
       ctx.translate(shake.x, shake.y);
       drawTable();
+      drawLandingMarker();
       drawPaddle(gameState.bot, true);
       drawBall(gameState.simTime);
       drawPaddle(gameState.player, false);
+      drawHitFeedback();
       ctx.restore();
       drawHud();
       drawPauseOverlay();
@@ -1341,10 +1554,16 @@
           gameState.handLandmarker = await HandLandmarker.createFromOptions(vision, handOptions);
         }
 
-        gameState.mode = "intro";
-        gameState.phase = "waiting-hand";
-        gameState.message = "Show your right hand to the camera to play";
+        if (gameState.inputMode !== "mouse" && gameState.mode === "loading") {
+          gameState.mode = "intro";
+          gameState.phase = "waiting-hand";
+          gameState.message = "Show your right hand to the camera to play";
+        }
       } catch (error) {
+        if (gameState.inputMode === "mouse" && gameState.mode === "playing") {
+          return;
+        }
+
         gameState.mode = "error";
         gameState.phase = "error";
         if (error?.name === "NotAllowedError" || error?.name === "PermissionDeniedError") {
@@ -1363,6 +1582,7 @@
 
     window.addEventListener("resize", resize);
     window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("keydown", handleKeyDown);
     init();
   </script>
