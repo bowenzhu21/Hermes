@@ -155,7 +155,7 @@
     }
 
     function playTone(frequency, duration, offset = 0, volume = 0.16) {
-      const audio = gameState.audio.ctx || ensureAudio();
+      const audio = gameState.audio.ctx;
       if (!audio || audio.state !== "running") {
         return;
       }
@@ -423,7 +423,7 @@
       const palmY = (wrist.y + middleBase.y + indexBase.y + pinkyBase.y) * 0.25;
       const mirroredX = 1 - palmX;
 
-      gameState.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.92, 0.92);
+      gameState.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.82, 0.82);
       gameState.player.targetZ = clamp(0.045 + (1 - palmY) * 0.19, 0.035, 0.235);
       gameState.handReady = true;
       gameState.handSeenAt = now;
@@ -435,9 +435,9 @@
       const oldZ = player.z;
       const smoothing = frameLerp(0.2, dt);
 
-      player.targetX = clamp(player.targetX, -0.92, 0.92);
+      player.targetX = clamp(player.targetX, -0.82, 0.82);
       player.targetZ = clamp(player.targetZ, 0.035, 0.235);
-      player.x = clamp(lerp(player.x, player.targetX, smoothing), -0.92, 0.92);
+      player.x = clamp(lerp(player.x, player.targetX, smoothing), -0.82, 0.82);
       player.z = clamp(lerp(player.z, player.targetZ, smoothing), 0.035, 0.235);
       player.vx = (player.x - oldX) / Math.max(dt, 0.001);
       player.vz = (player.z - oldZ) / Math.max(dt, 0.001);
@@ -546,7 +546,7 @@
       gameState.pendingGameWinner = getGameWinner();
       gameState.server = gameState.server === "player" ? "bot" : "player";
       gameState.scorePulseSide = winner;
-      gameState.scorePulseStartedAt = now;
+      gameState.scorePulseStartedAt = performance.now();
       gameState.bot.hitAvailable = false;
       playPointSound();
 
@@ -569,7 +569,7 @@
       if (gameState.pendingGameWinner) {
         gameState.winner = gameState.pendingGameWinner;
         gameState.phase = "game-over";
-        gameState.gameOverStartedAt = now;
+        gameState.gameOverStartedAt = performance.now();
         gameState.pendingGameWinner = null;
         if (gameState.winner === "player") {
           playWinSound();
@@ -697,35 +697,90 @@
       });
     }
 
+    function activeGameplayPhase() {
+      return gameState.phase === "player-serve" ||
+        gameState.phase === "bot-serve" ||
+        gameState.phase === "rally" ||
+        gameState.phase === "point-freeze";
+    }
+
+    function beginCountdown(now) {
+      gameState.phase = "countdown";
+      gameState.countdownStartedAt = now;
+      gameState.message = "Hand Detected";
+    }
+
+    function beginMatch() {
+      resetMatch(0);
+    }
+
     function update(now) {
-      const dt = Math.min((now - gameState.time) / 1000, 0.033);
+      const dt = Math.min((now - gameState.time) / 1000, 1 / 30);
       gameState.time = now;
+      gameState.renderTime = now;
 
-      if (gameState.mode === "playing") {
-        detectHand(now);
+      if (gameState.mode === "loading" || gameState.mode === "error") {
+        return;
+      }
 
-        if (gameState.phase === "point-freeze") {
-          if (now >= gameState.freezeUntil) {
-            finishPoint(now);
+      detectHand(now);
+
+      if (gameState.mode === "intro") {
+        if (handIsFresh(now)) {
+          if (gameState.phase !== "countdown") {
+            beginCountdown(now);
+          } else if (now - gameState.countdownStartedAt >= 1500) {
+            beginMatch();
           }
-          return;
+        } else {
+          gameState.phase = "waiting-hand";
+          gameState.countdownStartedAt = 0;
+          gameState.message = "Show your right hand to the camera to play";
         }
+        return;
+      }
 
-        updatePlayer(dt);
-        const pose = getBallPose(now);
-        updateBot(dt, pose, now);
+      if (gameState.mode !== "playing") {
+        return;
+      }
 
-        if (gameState.phase === "game-over") {
-          return;
+      if (activeGameplayPhase() && !handIsFresh(now)) {
+        gameState.pausedForHand = true;
+        if (!gameState.handLostAt) {
+          gameState.handLostAt = now;
         }
+        return;
+      }
 
-        if (gameState.phase === "player-serve") {
-          updatePlayerServe(now);
-        } else if (gameState.phase === "bot-serve") {
-          updateBotServe(now);
-        } else if (gameState.phase === "rally") {
-          updateBall(now);
+      if (gameState.pausedForHand && handIsFresh(now)) {
+        gameState.pausedForHand = false;
+        gameState.handLostAt = 0;
+      }
+
+      gameState.simTime += dt * 1000;
+      const simNow = gameState.simTime;
+
+      if (gameState.phase === "point-freeze") {
+        if (simNow >= gameState.freezeUntil) {
+          finishPoint(simNow);
         }
+        return;
+      }
+
+      updatePlayer(dt);
+      const pose = getBallPose(simNow);
+      updateBot(dt, pose, simNow);
+
+      if (gameState.phase === "game-over") {
+        return;
+      }
+
+      if (gameState.phase === "player-serve") {
+        updatePlayerServe(simNow);
+      } else if (gameState.phase === "bot-serve") {
+        updateBotServe(simNow);
+      } else if (gameState.phase === "rally") {
+        updateBall(simNow);
       }
     }
 
@@ -955,7 +1010,9 @@
 
       ctx.fillStyle = "rgba(255, 255, 255, 0.86)";
       ctx.font = "800 13px Nunito, Arial, Helvetica, sans-serif";
-      if (!gameState.handReady && gameState.mode === "playing") {
+      if (gameState.pausedForHand) {
+        // Pause overlay owns the hand-lost message.
+      } else if (!gameState.handReady && gameState.mode === "playing") {
         ctx.fillText("Show your right hand to control the paddle", cx, 112);
       } else if (gameState.handReady && performance.now() - gameState.handSeenAt > 700) {
         ctx.fillText("Right hand lost", cx, 112);
@@ -967,6 +1024,30 @@
 
       ctx.globalAlpha = 0.7;
       ctx.fillText(`Rally ${gameState.rally}`, cx, window.innerHeight - 32);
+      ctx.restore();
+    }
+
+    function drawPauseOverlay() {
+      if (!gameState.pausedForHand) {
+        return;
+      }
+
+      const cx = window.innerWidth * 0.5;
+      const cy = window.innerHeight * 0.5;
+      ctx.save();
+      ctx.fillStyle = "rgba(10, 10, 18, 0.62)";
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#ffffff";
+      ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+      ctx.shadowBlur = 12;
+      ctx.font = "900 34px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText("✋ Show your hand to resume", cx, cy);
+      ctx.fillStyle = "rgba(255, 255, 255, 0.7)";
+      ctx.shadowBlur = 0;
+      ctx.font = "800 15px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText("Keep your right hand in view of the camera", cx, cy + 44);
       ctx.restore();
     }
 
@@ -1040,7 +1121,9 @@
       ctx.restore();
     }
 
-    function resetMatch(now = performance.now()) {
+    function resetMatch(now = 0) {
+      gameState.mode = "playing";
+      gameState.simTime = now;
       gameState.score = { player: 0, bot: 0 };
       gameState.server = "player";
       gameState.pendingGameWinner = null;
@@ -1048,6 +1131,9 @@
       gameState.gameOverStartedAt = 0;
       gameState.scorePulseSide = null;
       gameState.scorePulseStartedAt = -Infinity;
+      gameState.pausedForHand = false;
+      gameState.handLostAt = 0;
+      gameState.ballTrail.length = 0;
       gameState.bot.history.length = 0;
       gameState.bot.targetX = 0;
       gameState.bot.aimBias = 0;
@@ -1055,10 +1141,18 @@
       startServe("player", now);
     }
 
-    function handlePointerDown(event) {
+    function handleInput(type, event) {
       ensureAudio();
 
       if (gameState.phase !== "game-over") {
+        return;
+      }
+
+      if (type === "key") {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          resetMatch(0);
+        }
         return;
       }
 
@@ -1069,43 +1163,111 @@
       const insideButton = x >= button.x && x <= button.x + button.w && y >= button.y && y <= button.y + button.h;
 
       if (insideButton) {
-        resetMatch();
+        resetMatch(0);
       }
+    }
+
+    function handlePointerDown(event) {
+      handleInput("pointer", event);
     }
 
     function handleKeyDown(event) {
-      ensureAudio();
-      if (gameState.phase === "game-over" && (event.key === "Enter" || event.key === " ")) {
-        event.preventDefault();
-        resetMatch();
-      }
+      handleInput("key", event);
     }
 
-    function drawLoading() {
+    function drawStartup() {
       ctx.save();
       ctx.fillStyle = "#0a0a12";
       ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
       const cx = window.innerWidth * 0.5;
       const cy = window.innerHeight * 0.5;
-      const pulse = 0.5 + Math.sin(performance.now() * 0.006) * 0.5;
+      const now = performance.now();
+      const pulse = 0.5 + Math.sin(now * 0.006) * 0.5;
 
-      ctx.strokeStyle = `rgba(255, 255, 255, ${0.22 + pulse * 0.42})`;
-      ctx.lineWidth = 4;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
       ctx.beginPath();
-      ctx.arc(cx, cy - 32, 24, -Math.PI * 0.5, Math.PI * (1.1 + pulse * 0.7));
-      ctx.stroke();
+      ctx.ellipse(cx, cy + 174, Math.min(330, window.innerWidth * 0.38), 44, 0, 0, Math.PI * 2);
+      ctx.fill();
 
-      ctx.fillStyle = "#f7f7f2";
-      ctx.font = "900 18px Nunito, Arial, Helvetica, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(gameState.message, cx, cy + 24);
+      ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
+      ctx.shadowBlur = 16;
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `900 ${Math.min(56, Math.max(34, window.innerWidth * 0.085))}px Nunito, Arial, Helvetica, sans-serif`;
+      ctx.fillText("🏓 WII PING PONG", cx, cy - 114);
 
-      ctx.fillStyle = "rgba(247, 247, 242, 0.64)";
-      ctx.font = "800 13px Nunito, Arial, Helvetica, sans-serif";
-      ctx.fillText("Allow camera access when prompted", cx, cy + 52);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "rgba(255, 255, 255, 0.78)";
+      ctx.font = "800 18px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText("Show your right hand to the camera to play", cx, cy - 60);
+
+      if (gameState.mode === "error") {
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "900 25px Nunito, Arial, Helvetica, sans-serif";
+        ctx.fillText(gameState.errorTitle || "Camera unavailable", cx, cy + 20);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.72)";
+        ctx.font = "800 15px Nunito, Arial, Helvetica, sans-serif";
+        ctx.fillText(gameState.errorDetail || "Allow camera access and reload this page.", cx, cy + 58);
+        ctx.restore();
+        return;
+      }
+
+      const handScale = 1 + pulse * 0.08;
+      ctx.save();
+      ctx.translate(cx, cy + 10);
+      ctx.scale(handScale, handScale);
+      ctx.fillStyle = handIsFresh(now) ? "#34d178" : "rgba(255, 255, 255, 0.92)";
+      ctx.font = "900 54px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText("✋", 0, 0);
       ctx.restore();
+
+      if (gameState.mode === "loading") {
+        ctx.strokeStyle = `rgba(255, 255, 255, ${0.2 + pulse * 0.36})`;
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(cx, cy + 82, 20, -Math.PI * 0.5, Math.PI * (1.1 + pulse * 0.7));
+        ctx.stroke();
+        ctx.fillStyle = "rgba(255, 255, 255, 0.72)";
+        ctx.font = "900 18px Nunito, Arial, Helvetica, sans-serif";
+        ctx.fillText(gameState.message, cx, cy + 126);
+        ctx.restore();
+        return;
+      }
+
+      if (gameState.phase === "countdown") {
+        const elapsed = now - gameState.countdownStartedAt;
+        const countdown = elapsed < 375 ? "3" : elapsed < 750 ? "2" : elapsed < 1125 ? "1" : "GO!";
+        ctx.fillStyle = "#34d178";
+        ctx.font = "900 19px Nunito, Arial, Helvetica, sans-serif";
+        ctx.fillText("Hand Detected ✓", cx, cy + 78);
+        ctx.fillStyle = "#ffffff";
+        ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+        ctx.shadowBlur = 10;
+        ctx.font = "900 46px Nunito, Arial, Helvetica, sans-serif";
+        ctx.fillText(countdown, cx, cy + 134);
+      } else {
+        ctx.fillStyle = "rgba(255, 255, 255, 0.62)";
+        ctx.font = "900 17px Nunito, Arial, Helvetica, sans-serif";
+        ctx.fillText("Waiting for hand", cx, cy + 84);
+      }
+
+      ctx.restore();
+    }
+
+    function getScreenShakeOffset() {
+      const elapsed = performance.now() - gameState.shakeStartedAt;
+      if (elapsed < 0 || elapsed > gameState.shakeDuration) {
+        return { x: 0, y: 0 };
+      }
+
+      const falloff = 1 - elapsed / gameState.shakeDuration;
+      const amount = gameState.shakeAmount * falloff;
+      return {
+        x: Math.sin(elapsed * 0.55) * amount,
+        y: Math.cos(elapsed * 0.72) * amount
+      };
     }
 
     function draw() {
@@ -1114,15 +1276,20 @@
       ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
       if (gameState.mode !== "playing") {
-        drawLoading();
+        drawStartup();
         return;
       }
 
+      const shake = getScreenShakeOffset();
+      ctx.save();
+      ctx.translate(shake.x, shake.y);
       drawTable();
       drawPaddle(gameState.bot, true);
-      drawBall(performance.now());
+      drawBall(gameState.simTime);
       drawPaddle(gameState.player, false);
+      ctx.restore();
       drawHud();
+      drawPauseOverlay();
       drawGameOver();
     }
 
@@ -1135,7 +1302,7 @@
     async function init() {
       resize();
       requestAnimationFrame(frame);
-      document.fonts?.load("900 56px Nunito").catch(() => {});
+      document.fonts?.load("900 56px Nunito")?.catch(() => {});
 
       try {
         gameState.message = "Starting webcam";
@@ -1155,7 +1322,7 @@
 
         gameState.message = "Loading hand tracker";
         const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
-        gameState.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        const handOptions = {
           baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
             delegate: "GPU"
@@ -1165,16 +1332,32 @@
           minHandDetectionConfidence: 0.55,
           minHandPresenceConfidence: 0.5,
           minTrackingConfidence: 0.5
-        });
+        };
 
-        gameState.mode = "playing";
-        gameState.message = "";
-        startServe(gameState.server);
+        try {
+          gameState.handLandmarker = await HandLandmarker.createFromOptions(vision, handOptions);
+        } catch {
+          handOptions.baseOptions.delegate = "CPU";
+          gameState.handLandmarker = await HandLandmarker.createFromOptions(vision, handOptions);
+        }
+
+        gameState.mode = "intro";
+        gameState.phase = "waiting-hand";
+        gameState.message = "Show your right hand to the camera to play";
       } catch (error) {
-        console.error(error);
         gameState.mode = "error";
         gameState.phase = "error";
-        gameState.message = "Camera or hand tracker failed to load";
+        if (error?.name === "NotAllowedError" || error?.name === "PermissionDeniedError") {
+          gameState.errorTitle = "Camera permission denied";
+          gameState.errorDetail = "Allow camera access for this site, then reload the page.";
+        } else if (error?.name === "NotFoundError" || error?.name === "DevicesNotFoundError") {
+          gameState.errorTitle = "No camera found";
+          gameState.errorDetail = "Connect a webcam, then reload this page.";
+        } else {
+          gameState.errorTitle = "Camera setup failed";
+          gameState.errorDetail = "Use Chrome or Safari on localhost and allow webcam access.";
+        }
+        gameState.message = gameState.errorTitle;
       }
     }
 
