@@ -5,14 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Wii Ping Pong</title>
   <style>
+    @import url("https://fonts.googleapis.com/css2?family=Nunito:wght@700;800;900&display=swap");
+
     html,
     body {
       width: 100%;
       height: 100%;
       margin: 0;
       overflow: hidden;
-      background: #0d0d0d;
-      font-family: Arial, Helvetica, sans-serif;
+      background: #0a0a12;
+      font-family: "Nunito", Arial, Helvetica, sans-serif;
       color: #f7f7f2;
     }
 
@@ -20,7 +22,7 @@
       display: block;
       width: 100vw;
       height: 100vh;
-      background: #0d0d0d;
+      background: #0a0a12;
     }
 
     video {
@@ -45,7 +47,7 @@
     const ctx = canvas.getContext("2d");
     const video = document.getElementById("webcam");
 
-    const state = {
+    const gameState = {
       mode: "loading",
       phase: "loading",
       message: "Loading hand tracker",
@@ -64,6 +66,14 @@
       freezeUntil: 0,
       pendingGameWinner: null,
       winner: null,
+      gameOverStartedAt: 0,
+      scorePulseSide: null,
+      scorePulseStartedAt: -Infinity,
+      playAgainButton: { x: 0, y: 0, w: 0, h: 0 },
+      audio: {
+        ctx: null,
+        unlocked: false
+      },
       hitFlash: 0,
       netFlash: 0,
       ballTrail: [],
@@ -76,7 +86,8 @@
         prevZ: 0.08,
         vx: 0,
         vz: 0,
-        radius: 58
+        radius: 58,
+        pulseStartedAt: -Infinity
       },
       bot: {
         x: 0,
@@ -93,7 +104,8 @@
         nextHitAt: 0,
         willMisAim: false,
         swingStartedAt: -Infinity,
-        swingDuration: 240
+        swingDuration: 240,
+        pulseStartedAt: -Infinity
       },
       ball: null
     };
@@ -103,11 +115,71 @@
     const ease = (t) => t * t * (3 - 2 * t);
     const randomRange = (min, max) => min + Math.random() * (max - min);
 
+    function ensureAudio() {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) {
+        return null;
+      }
+
+      if (!gameState.audio.ctx) {
+        gameState.audio.ctx = new AudioContextClass();
+      }
+
+      if (gameState.audio.ctx.state === "suspended") {
+        gameState.audio.ctx.resume().catch(() => {});
+      }
+
+      gameState.audio.unlocked = true;
+      return gameState.audio.ctx;
+    }
+
+    function playTone(frequency, duration, offset = 0, volume = 0.16) {
+      const audio = gameState.audio.ctx || ensureAudio();
+      if (!audio || audio.state !== "running") {
+        return;
+      }
+
+      const start = audio.currentTime + offset;
+      const osc = audio.createOscillator();
+      const gain = audio.createGain();
+
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(frequency, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(volume, start + 0.004);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      osc.connect(gain);
+      gain.connect(audio.destination);
+      osc.start(start);
+      osc.stop(start + duration + 0.02);
+    }
+
+    function playBallHitSound() {
+      playTone(480, 0.04, 0, 0.18);
+    }
+
+    function playTableBounceSound() {
+      playTone(320, 0.04, 0, 0.14);
+    }
+
+    function playPointSound() {
+      playTone(523.25, 0.08, 0, 0.14);
+      playTone(659.25, 0.08, 0.09, 0.13);
+    }
+
+    function playWinSound() {
+      playTone(523.25, 0.09, 0, 0.13);
+      playTone(659.25, 0.09, 0.1, 0.13);
+      playTone(783.99, 0.09, 0.2, 0.13);
+      playTone(1046.5, 0.14, 0.31, 0.14);
+    }
+
     function resize() {
-      state.dpr = Math.min(window.devicePixelRatio || 1, 2);
-      canvas.width = Math.floor(window.innerWidth * state.dpr);
-      canvas.height = Math.floor(window.innerHeight * state.dpr);
-      ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+      gameState.dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.floor(window.innerWidth * gameState.dpr);
+      canvas.height = Math.floor(window.innerHeight * gameState.dpr);
+      ctx.setTransform(gameState.dpr, 0, 0, gameState.dpr, 0, 0);
       computeTable();
     }
 
@@ -121,7 +193,7 @@
       const topWidth = Math.min(w * 0.52, tableHeight * 0.78);
       const bottomWidth = Math.min(w * 0.86, tableHeight * 1.18);
 
-      state.table = {
+      gameState.table = {
         cx,
         topY,
         bottomY,
@@ -134,37 +206,37 @@
         bottomLeft: { x: cx - bottomWidth * 0.5, y: bottomY }
       };
 
-      if (!state.ball) {
-        prepareServeBall(state.server);
+      if (!gameState.ball) {
+        prepareServeBall(gameState.server);
       }
     }
 
     function tableWidthAt(z) {
-      return lerp(state.table.bottomWidth, state.table.topWidth, ease(clamp(z, 0, 1)));
+      return lerp(gameState.table.bottomWidth, gameState.table.topWidth, ease(clamp(z, 0, 1)));
     }
 
     function tableYAt(z) {
       if (z < 0) {
-        return state.table.bottomY + Math.abs(z) * state.table.height * 0.34;
+        return gameState.table.bottomY + Math.abs(z) * gameState.table.height * 0.34;
       }
       if (z > 1) {
-        return state.table.topY - (z - 1) * state.table.height * 0.34;
+        return gameState.table.topY - (z - 1) * gameState.table.height * 0.34;
       }
-      return lerp(state.table.bottomY, state.table.topY, ease(z));
+      return lerp(gameState.table.bottomY, gameState.table.topY, ease(z));
     }
 
     function tablePoint(xNorm, z) {
       const width = tableWidthAt(z);
       return {
-        x: state.table.cx + xNorm * width * 0.5,
+        x: gameState.table.cx + xNorm * width * 0.5,
         y: tableYAt(z)
       };
     }
 
     function prepareServeBall(server) {
       const servingPlayer = server === "player";
-      const paddle = servingPlayer ? state.player : state.bot;
-      state.ball = {
+      const paddle = servingPlayer ? gameState.player : gameState.bot;
+      gameState.ball = {
         active: false,
         x: paddle.x,
         y: servingPlayer ? 24 : 26,
@@ -183,28 +255,28 @@
         hitWindowOpen: false,
         radius: 11
       };
-      state.bot.hitAvailable = false;
-      state.ballTrail.length = 0;
+      gameState.bot.hitAvailable = false;
+      gameState.ballTrail.length = 0;
     }
 
     function startServe(server, now = performance.now()) {
-      state.server = server;
-      state.phase = server === "player" ? "player-serve" : "bot-serve";
-      state.serveStartedAt = now;
-      state.botServeAt = now + 1500;
-      state.rally = 0;
-      state.netFlash = 0;
+      gameState.server = server;
+      gameState.phase = server === "player" ? "player-serve" : "bot-serve";
+      gameState.serveStartedAt = now;
+      gameState.botServeAt = now + 1500;
+      gameState.rally = 0;
+      gameState.netFlash = 0;
       prepareServeBall(server);
     }
 
     function launchBall({ fromX, fromZ, toX, toZ, direction, power, spin, sideSpin }) {
       const now = performance.now();
-      const speedBoost = Math.min(state.rally * 32, 260);
+      const speedBoost = Math.min(gameState.rally * 32, 260);
       const powerBoost = clamp(power * 180, 0, 260);
       const baseDuration = direction > 0 ? 1080 : 1030;
       const distance = Math.abs(toZ - fromZ);
 
-      state.ball = {
+      gameState.ball = {
         active: true,
         x: fromX,
         y: 0,
@@ -223,14 +295,14 @@
         hitWindowOpen: true,
         radius: 11
       };
-      state.phase = "rally";
-      state.ballTrail.length = 0;
+      gameState.phase = "rally";
+      gameState.ballTrail.length = 0;
       scheduleBotHit();
     }
 
     function scheduleBotHit() {
-      const ball = state.ball;
-      const bot = state.bot;
+      const ball = gameState.ball;
+      const bot = gameState.bot;
 
       bot.hitAvailable = false;
       if (!ball.active || ball.direction <= 0) {
@@ -248,7 +320,7 @@
     }
 
     function getBallPose(now) {
-      const ball = state.ball;
+      const ball = gameState.ball;
       if (!ball.active) {
         return {
           t: 0,
@@ -293,12 +365,12 @@
     }
 
     function detectHand(now) {
-      if (!state.handLandmarker || video.readyState < 2 || video.currentTime === state.lastVideoTime) {
+      if (!gameState.handLandmarker || video.readyState < 2 || video.currentTime === gameState.lastVideoTime) {
         return;
       }
 
-      state.lastVideoTime = video.currentTime;
-      const result = state.handLandmarker.detectForVideo(video, now);
+      gameState.lastVideoTime = video.currentTime;
+      const result = gameState.handLandmarker.detectForVideo(video, now);
       if (!result.landmarks || result.landmarks.length === 0) {
         return;
       }
@@ -323,14 +395,14 @@
       const palmY = (wrist.y + middleBase.y + indexBase.y + pinkyBase.y) * 0.25;
       const mirroredX = 1 - palmX;
 
-      state.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.92, 0.92);
-      state.player.targetZ = clamp(0.045 + (1 - palmY) * 0.19, 0.035, 0.235);
-      state.handReady = true;
-      state.handSeenAt = now;
+      gameState.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.92, 0.92);
+      gameState.player.targetZ = clamp(0.045 + (1 - palmY) * 0.19, 0.035, 0.235);
+      gameState.handReady = true;
+      gameState.handSeenAt = now;
     }
 
     function updatePlayer(dt) {
-      const player = state.player;
+      const player = gameState.player;
       const oldX = player.x;
       const oldZ = player.z;
 
@@ -341,14 +413,14 @@
       player.prevX = oldX;
       player.prevZ = oldZ;
 
-      state.hitFlash = Math.max(0, state.hitFlash - dt * 5.4);
-      state.bot.flash = Math.max(0, state.bot.flash - dt * 4.2);
-      state.netFlash = Math.max(0, state.netFlash - dt * 6);
+      gameState.hitFlash = Math.max(0, gameState.hitFlash - dt * 5.4);
+      gameState.bot.flash = Math.max(0, gameState.bot.flash - dt * 4.2);
+      gameState.netFlash = Math.max(0, gameState.netFlash - dt * 6);
     }
 
     function updateBot(dt, pose, now) {
-      const bot = state.bot;
-      const totalPoints = state.score.player + state.score.bot;
+      const bot = gameState.bot;
+      const totalPoints = gameState.score.player + gameState.score.bot;
       const difficultySteps = Math.floor(totalPoints / 5);
       const swingAge = now - bot.swingStartedAt;
       const swingAmount = swingAge < bot.swingDuration ? Math.sin((swingAge / bot.swingDuration) * Math.PI) : 0;
@@ -356,7 +428,7 @@
       bot.lerpFactor = Math.min(0.15, 0.08 + difficultySteps * 0.012);
       bot.z = bot.baseZ - swingAmount * 0.075;
 
-      if (state.phase === "rally" && state.ball.direction > 0) {
+      if (gameState.phase === "rally" && gameState.ball.direction > 0) {
         bot.history.push({ time: now, x: pose.x });
         while (bot.history.length > 0 && now - bot.history[0].time > 900) {
           bot.history.shift();
@@ -373,10 +445,10 @@
         }
 
         bot.targetX = observed ? clamp(observed.x + bot.aimBias, -0.78, 0.78) : bot.targetX;
-      } else if (state.phase === "bot-serve") {
+      } else if (gameState.phase === "bot-serve") {
         bot.targetX = 0;
-      } else if (state.phase === "player-serve") {
-        bot.targetX = clamp(state.player.x * 0.18, -0.4, 0.4);
+      } else if (gameState.phase === "player-serve") {
+        bot.targetX = clamp(gameState.player.x * 0.18, -0.4, 0.4);
       } else {
         bot.targetX = lerp(bot.targetX, 0, 0.025);
       }
@@ -385,7 +457,7 @@
     }
 
     function updateBall(now) {
-      const ball = state.ball;
+      const ball = gameState.ball;
       const pose = getBallPose(now);
 
       ball.x = pose.x;
@@ -397,16 +469,17 @@
         const crossed = ball.direction > 0 ? pose.z >= bounceZ : pose.z <= bounceZ;
         if (crossed) {
           ball.hasBounced = true;
-          state.netFlash = 1;
+          gameState.netFlash = 1;
+          playTableBounceSound();
         }
       }
 
       if (ball.direction < 0 && ball.hitWindowOpen && pose.z < 0.15) {
         const ballPoint = tablePoint(pose.x, pose.z);
-        const paddlePoint = tablePoint(state.player.x, state.player.z);
+        const paddlePoint = tablePoint(gameState.player.x, gameState.player.z);
         const distance = Math.hypot(ballPoint.x - paddlePoint.x, ballPoint.y - paddlePoint.y);
 
-        if (distance <= 80 && state.handReady && now - state.handSeenAt < 250) {
+        if (distance <= 80 && gameState.handReady && now - gameState.handSeenAt < 250) {
           playerHit(pose);
           return;
         } else if (pose.z < 0.055) {
@@ -414,12 +487,12 @@
         }
       }
 
-      if (ball.direction > 0 && state.bot.hitAvailable && now >= state.bot.nextHitAt && pose.z > 0.82) {
+      if (ball.direction > 0 && gameState.bot.hitAvailable && now >= gameState.bot.nextHitAt && pose.z > 0.82) {
         const ballPoint = tablePoint(pose.x, pose.z);
-        const paddlePoint = tablePoint(state.bot.x, state.bot.z);
+        const paddlePoint = tablePoint(gameState.bot.x, gameState.bot.z);
         const distance = Math.hypot(ballPoint.x - paddlePoint.x, ballPoint.y - paddlePoint.y);
 
-        state.bot.hitAvailable = false;
+        gameState.bot.hitAvailable = false;
         if (distance <= 92) {
           botHit(pose);
           return;
@@ -436,22 +509,25 @@
     }
 
     function scorePoint(winner, now, pose) {
-      state.score[winner] += 1;
-      state.phase = "point-freeze";
-      state.freezeUntil = now + 200;
-      state.pendingGameWinner = getGameWinner();
-      state.server = state.server === "player" ? "bot" : "player";
-      state.bot.hitAvailable = false;
+      gameState.score[winner] += 1;
+      gameState.phase = "point-freeze";
+      gameState.freezeUntil = now + 200;
+      gameState.pendingGameWinner = getGameWinner();
+      gameState.server = gameState.server === "player" ? "bot" : "player";
+      gameState.scorePulseSide = winner;
+      gameState.scorePulseStartedAt = now;
+      gameState.bot.hitAvailable = false;
+      playPointSound();
 
-      state.ball.active = false;
-      state.ball.x = pose.x;
-      state.ball.y = pose.y;
-      state.ball.z = pose.z;
-      state.ballTrail.length = 0;
+      gameState.ball.active = false;
+      gameState.ball.x = pose.x;
+      gameState.ball.y = pose.y;
+      gameState.ball.z = pose.z;
+      gameState.ballTrail.length = 0;
     }
 
     function getGameWinner() {
-      const { player, bot } = state.score;
+      const { player, bot } = gameState.score;
       if (Math.max(player, bot) >= 11 && Math.abs(player - bot) >= 2) {
         return player > bot ? "player" : "bot";
       }
@@ -459,35 +535,41 @@
     }
 
     function finishPoint(now) {
-      if (state.pendingGameWinner) {
-        state.winner = state.pendingGameWinner;
-        state.phase = "game-over";
-        state.pendingGameWinner = null;
+      if (gameState.pendingGameWinner) {
+        gameState.winner = gameState.pendingGameWinner;
+        gameState.phase = "game-over";
+        gameState.gameOverStartedAt = now;
+        gameState.pendingGameWinner = null;
+        if (gameState.winner === "player") {
+          playWinSound();
+        }
         return;
       }
 
-      startServe(state.server, now);
+      startServe(gameState.server, now);
     }
 
     function updatePlayerServe(now) {
-      const player = state.player;
+      const player = gameState.player;
       const handSpeed = Math.hypot(player.vx * 0.85, player.vz * 2.2);
 
-      state.ball.x = player.x;
-      state.ball.z = player.z;
-      state.ball.y = 24;
-      state.ball.fromX = player.x;
-      state.ball.fromZ = player.z;
-      state.ball.toX = player.x;
-      state.ball.toZ = player.z;
+      gameState.ball.x = player.x;
+      gameState.ball.z = player.z;
+      gameState.ball.y = 24;
+      gameState.ball.fromX = player.x;
+      gameState.ball.fromZ = player.z;
+      gameState.ball.toX = player.x;
+      gameState.ball.toZ = player.z;
 
-      if (now - state.serveStartedAt < 250 || !state.handReady || now - state.handSeenAt > 300) {
+      if (now - gameState.serveStartedAt < 250 || !gameState.handReady || now - gameState.handSeenAt > 300) {
         return;
       }
 
       if (player.vz > 0.35 || (player.vz > 0.14 && handSpeed > 0.58)) {
-        state.rally = 0;
-        state.hitFlash = 1;
+        gameState.rally = 0;
+        gameState.hitFlash = 1;
+        player.pulseStartedAt = now;
+        playBallHitSound();
         launchBall({
           fromX: player.x,
           fromZ: player.z,
@@ -502,25 +584,27 @@
     }
 
     function updateBotServe(now) {
-      const elapsed = now - state.serveStartedAt;
+      const elapsed = now - gameState.serveStartedAt;
       const tossT = clamp(elapsed / 1500, 0, 1);
       const tossLift = Math.sin(tossT * Math.PI) * 46;
 
-      state.ball.x = state.bot.x;
-      state.ball.z = state.bot.baseZ - 0.025;
-      state.ball.y = 24 + tossLift;
-      state.ball.fromX = state.ball.x;
-      state.ball.fromZ = state.ball.z;
-      state.ball.toX = state.ball.x;
-      state.ball.toZ = state.ball.z;
+      gameState.ball.x = gameState.bot.x;
+      gameState.ball.z = gameState.bot.baseZ - 0.025;
+      gameState.ball.y = 24 + tossLift;
+      gameState.ball.fromX = gameState.ball.x;
+      gameState.ball.fromZ = gameState.ball.z;
+      gameState.ball.toX = gameState.ball.x;
+      gameState.ball.toZ = gameState.ball.z;
 
-      if (now >= state.botServeAt) {
-        state.bot.flash = 1;
-        state.bot.swingStartedAt = now;
+      if (now >= gameState.botServeAt) {
+        gameState.bot.flash = 1;
+        gameState.bot.swingStartedAt = now;
+        gameState.bot.pulseStartedAt = now;
+        playBallHitSound();
         launchBall({
-          fromX: state.bot.x,
-          fromZ: state.bot.baseZ - 0.025,
-          toX: clamp(state.player.x * 0.32 + randomRange(-0.12, 0.12), -0.65, 0.65),
+          fromX: gameState.bot.x,
+          fromZ: gameState.bot.baseZ - 0.025,
+          toX: clamp(gameState.player.x * 0.32 + randomRange(-0.12, 0.12), -0.65, 0.65),
           toZ: -0.08,
           direction: -1,
           power: 0.22,
@@ -531,7 +615,7 @@
     }
 
     function playerHit(pose) {
-      const player = state.player;
+      const player = gameState.player;
       const handSpeed = Math.hypot(player.vx * 0.8, player.vz * 2.4);
       const swipe = clamp(player.vx * 0.09, -0.55, 0.55);
       const depthDrive = clamp(player.vz * 0.08, -0.04, 0.08);
@@ -539,8 +623,10 @@
       const targetZ = 1.08 + depthDrive;
       const spin = clamp(player.vz * 0.8 + handSpeed * 0.06, -1, 1.25);
 
-      state.rally += 1;
-      state.hitFlash = 1;
+      gameState.rally += 1;
+      gameState.hitFlash = 1;
+      player.pulseStartedAt = performance.now();
+      playBallHitSound();
       launchBall({
         fromX: pose.x,
         fromZ: pose.z,
@@ -554,36 +640,38 @@
     }
 
     function botHit(pose) {
-      const bot = state.bot;
+      const bot = gameState.bot;
       const miss = bot.willMisAim ? randomRange(-0.26, 0.26) : randomRange(-0.055, 0.055);
       const returnAngle = clamp((bot.x - pose.x) * 0.36 + miss, -0.42, 0.42);
-      const targetX = clamp(state.player.x * 0.52 + returnAngle, -0.78, 0.78);
+      const targetX = clamp(gameState.player.x * 0.52 + returnAngle, -0.78, 0.78);
       const targetZ = -0.08 - Math.random() * 0.035;
 
-      state.rally += 1;
+      gameState.rally += 1;
       bot.flash = 1;
       bot.swingStartedAt = performance.now();
+      bot.pulseStartedAt = bot.swingStartedAt;
+      playBallHitSound();
       launchBall({
         fromX: pose.x,
         fromZ: pose.z,
         toX: targetX,
         toZ: targetZ,
         direction: -1,
-        power: 0.46 + Math.random() * 0.24 + state.rally * 0.025,
+        power: 0.46 + Math.random() * 0.24 + gameState.rally * 0.025,
         spin: (Math.random() - 0.42) * 0.9,
         sideSpin: returnAngle * 1.3
       });
     }
 
     function update(now) {
-      const dt = Math.min((now - state.time) / 1000, 0.033);
-      state.time = now;
+      const dt = Math.min((now - gameState.time) / 1000, 0.033);
+      gameState.time = now;
 
-      if (state.mode === "playing") {
+      if (gameState.mode === "playing") {
         detectHand(now);
 
-        if (state.phase === "point-freeze") {
-          if (now >= state.freezeUntil) {
+        if (gameState.phase === "point-freeze") {
+          if (now >= gameState.freezeUntil) {
             finishPoint(now);
           }
           return;
@@ -593,45 +681,68 @@
         const pose = getBallPose(now);
         updateBot(dt, pose, now);
 
-        if (state.phase === "game-over") {
+        if (gameState.phase === "game-over") {
           return;
         }
 
-        if (state.phase === "player-serve") {
+        if (gameState.phase === "player-serve") {
           updatePlayerServe(now);
-        } else if (state.phase === "bot-serve") {
+        } else if (gameState.phase === "bot-serve") {
           updateBotServe(now);
-        } else if (state.phase === "rally") {
+        } else if (gameState.phase === "rally") {
           updateBall(now);
         }
       }
     }
 
+    function roundedRect(x, y, width, height, radius) {
+      const r = Math.min(radius, width * 0.5, height * 0.5);
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + width - r, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+      ctx.lineTo(x + width, y + height - r);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+      ctx.lineTo(x + r, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+    }
+
+    function pulseScale(startedAt, duration = 80, amount = 0.15) {
+      const t = (performance.now() - startedAt) / duration;
+      if (t < 0 || t > 1) {
+        return 1;
+      }
+      return 1 + Math.sin(t * Math.PI) * amount;
+    }
+
     function drawTable() {
-      const table = state.table;
+      const table = gameState.table;
 
       ctx.save();
-      ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
-      ctx.shadowBlur = 32;
-      ctx.shadowOffsetY = 22;
-      makeTablePath();
-      const felt = ctx.createLinearGradient(0, table.topY, 0, table.bottomY);
-      felt.addColorStop(0, "#1c7b46");
-      felt.addColorStop(0.45, "#16844b");
-      felt.addColorStop(1, "#0c6039");
-      ctx.fillStyle = felt;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.46)";
+      ctx.beginPath();
+      ctx.ellipse(table.cx, table.bottomY - table.height * 0.05, table.bottomWidth * 0.58, table.height * 0.16, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
 
       ctx.save();
-      makeTablePath();
+      makeTablePath(0.08);
+      const wood = ctx.createLinearGradient(0, table.topY, 0, table.bottomY);
+      wood.addColorStop(0, "#a87337");
+      wood.addColorStop(0.48, "#8a572b");
+      wood.addColorStop(1, "#6f421f");
+      ctx.fillStyle = wood;
+      ctx.fill();
       ctx.clip();
-      ctx.globalAlpha = 0.1;
-      for (let i = 0; i < 18; i += 1) {
-        const z = i / 17;
-        const p1 = tablePoint(-1, z);
-        const p2 = tablePoint(1, z);
-        ctx.strokeStyle = i % 2 === 0 ? "#d7ffe6" : "#083c25";
+
+      for (let i = 0; i < 8; i += 1) {
+        const z = 0.08 + i * 0.12;
+        const p1 = tablePoint(-1.1, z);
+        const p2 = tablePoint(1.1, z + 0.015);
+        ctx.strokeStyle = i % 2 === 0 ? "rgba(255, 218, 161, 0.18)" : "rgba(46, 24, 10, 0.22)";
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(p1.x, p1.y);
@@ -640,38 +751,51 @@
       }
       ctx.restore();
 
-      drawTableLine(-1, 0, -1, 1, 8);
-      drawTableLine(1, 0, 1, 1, 8);
-      drawTableLine(-1, 0, 1, 0, 8);
+      ctx.save();
+      makeTablePath();
+      const felt = ctx.createLinearGradient(0, table.topY, 0, table.bottomY);
+      felt.addColorStop(0, "#367a36");
+      felt.addColorStop(0.42, "#2d6a2d");
+      felt.addColorStop(1, "#255b25");
+      ctx.fillStyle = felt;
+      ctx.fill();
+      ctx.restore();
+
+      drawTableLine(-1, 0, -1, 1, 5);
+      drawTableLine(1, 0, 1, 1, 5);
+      drawTableLine(-1, 0, 1, 0, 5);
       drawTableLine(-1, 1, 1, 1, 5);
-      drawTableLine(0, 0, 0, 1, 4);
-      drawTableLine(-1, 0.5, 1, 0.5, 5);
+      drawTableLine(0, 0, 0, 1, 3);
 
       const netLeft = tablePoint(-1.03, 0.5);
       const netRight = tablePoint(1.03, 0.5);
       ctx.save();
-      ctx.strokeStyle = state.netFlash > 0 ? `rgba(255, 255, 255, ${0.55 + state.netFlash * 0.35})` : "rgba(235, 245, 238, 0.48)";
-      ctx.lineWidth = 6;
+      ctx.lineCap = "round";
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.36)";
+      ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.moveTo(netLeft.x, netLeft.y - 8);
-      ctx.lineTo(netRight.x, netRight.y - 8);
+      ctx.moveTo(netLeft.x, netLeft.y + 3);
+      ctx.lineTo(netRight.x, netRight.y + 3);
       ctx.stroke();
-      ctx.strokeStyle = "rgba(23, 31, 25, 0.78)";
+      ctx.strokeStyle = gameState.netFlash > 0 ? `rgba(255, 255, 255, ${0.72 + gameState.netFlash * 0.25})` : "rgba(255, 255, 255, 0.86)";
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(netLeft.x, netLeft.y - 2);
-      ctx.lineTo(netRight.x, netRight.y - 2);
+      ctx.moveTo(netLeft.x, netLeft.y - 1);
+      ctx.lineTo(netRight.x, netRight.y - 1);
       ctx.stroke();
       ctx.restore();
     }
 
-    function makeTablePath() {
-      const table = state.table;
+    function makeTablePath(expand = 0) {
+      const topLeft = tablePoint(-1 - expand, 1);
+      const topRight = tablePoint(1 + expand, 1);
+      const bottomRight = tablePoint(1 + expand, 0);
+      const bottomLeft = tablePoint(-1 - expand, 0);
       ctx.beginPath();
-      ctx.moveTo(table.topLeft.x, table.topLeft.y);
-      ctx.lineTo(table.topRight.x, table.topRight.y);
-      ctx.lineTo(table.bottomRight.x, table.bottomRight.y);
-      ctx.lineTo(table.bottomLeft.x, table.bottomLeft.y);
+      ctx.moveTo(topLeft.x, topLeft.y);
+      ctx.lineTo(topRight.x, topRight.y);
+      ctx.lineTo(bottomRight.x, bottomRight.y);
+      ctx.lineTo(bottomLeft.x, bottomLeft.y);
       ctx.closePath();
     }
 
@@ -679,7 +803,7 @@
       const a = tablePoint(x1, z1);
       const b = tablePoint(x2, z2);
       ctx.save();
-      ctx.strokeStyle = "rgba(244, 250, 237, 0.9)";
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.94)";
       ctx.lineWidth = width;
       ctx.lineCap = "round";
       ctx.beginPath();
@@ -689,31 +813,40 @@
       ctx.restore();
     }
 
-    function drawPaddle(paddle, color, flash = 0, isBot = false) {
+    function drawPaddle(paddle, isBot = false) {
       const point = tablePoint(paddle.x, paddle.z);
-      const width = isBot ? 76 : 88;
-      const height = isBot ? 24 : 30;
+      const faceWidth = isBot ? 70 : 86;
+      const faceHeight = isBot ? 24 : 32;
+      const handleWidth = isBot ? 15 : 18;
+      const handleHeight = isBot ? 30 : 38;
+      const pulse = pulseScale(paddle.pulseStartedAt);
+      const yScale = isBot ? 0.78 : 0.9;
+      const handleY = isBot ? -faceHeight * 0.5 - handleHeight + 4 : faceHeight * 0.5 - 4;
 
       ctx.save();
       ctx.translate(point.x, point.y);
-      ctx.scale(1, isBot ? 0.72 : 0.82);
-      ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
-      ctx.shadowBlur = 16;
-      ctx.shadowOffsetY = 10;
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.ellipse(0, 0, width * 0.5, height * 0.5, 0, 0, Math.PI * 2);
+      ctx.scale(pulse, pulse * yScale);
+      ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetY = isBot ? 4 : 7;
+
+      ctx.fillStyle = "#25201c";
+      roundedRect(-handleWidth * 0.5, handleY, handleWidth, handleHeight, 5);
       ctx.fill();
+
+      ctx.fillStyle = "#b82124";
+      roundedRect(-faceWidth * 0.5, -faceHeight * 0.5, faceWidth, faceHeight, 9);
+      ctx.fill();
+
       ctx.shadowColor = "transparent";
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.22)";
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.26)";
+      ctx.lineWidth = 2;
       ctx.stroke();
 
-      if (flash > 0) {
-        ctx.globalAlpha = flash;
+      if ((isBot ? gameState.bot.flash : gameState.hitFlash) > 0) {
+        ctx.globalAlpha = (isBot ? gameState.bot.flash : gameState.hitFlash) * 0.42;
         ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
-        ctx.beginPath();
-        ctx.ellipse(0, 0, width * 0.53, height * 0.55, 0, 0, Math.PI * 2);
+        roundedRect(-faceWidth * 0.5, -faceHeight * 0.5, faceWidth, faceHeight, 9);
         ctx.fill();
       }
       ctx.restore();
@@ -724,45 +857,24 @@
       const ground = tablePoint(pose.x, pose.z);
       const ballY = ground.y - pose.lift;
       const perspectiveScale = lerp(1.15, 0.74, clamp(pose.z, 0, 1));
-      const radius = state.ball.radius * perspectiveScale;
-
-      if (state.ball.active && state.phase === "rally") {
-        state.ballTrail.push({ x: ground.x, y: ballY, r: radius, age: 1 });
-        if (state.ballTrail.length > 8) {
-          state.ballTrail.shift();
-        }
-      }
+      const radius = gameState.ball.radius * perspectiveScale;
 
       ctx.save();
-      for (const mark of state.ballTrail) {
-        mark.age *= 0.76;
-        ctx.globalAlpha = mark.age * 0.18;
-        ctx.fillStyle = "#ffffff";
-        ctx.beginPath();
-        ctx.arc(mark.x, mark.y, mark.r, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.restore();
-
-      ctx.save();
-      ctx.globalAlpha = 0.34;
-      ctx.fillStyle = "#000000";
+      ctx.globalAlpha = 0.42;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.78)";
       ctx.beginPath();
-      ctx.ellipse(ground.x, ground.y + 7, radius * 1.35 * pose.shadowScale, radius * 0.42 * pose.shadowScale, 0, 0, Math.PI * 2);
+      ctx.ellipse(ground.x + 4, ground.y + 5, radius * 1.2 * pose.shadowScale, radius * 0.38 * pose.shadowScale, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
 
       ctx.save();
-      ctx.shadowColor = "rgba(255, 255, 255, 0.55)";
-      ctx.shadowBlur = 9;
-      const ballLight = ctx.createRadialGradient(ground.x - radius * 0.35, ballY - radius * 0.45, radius * 0.1, ground.x, ballY, radius);
-      ballLight.addColorStop(0, "#ffffff");
-      ballLight.addColorStop(0.58, "#f4f4ec");
-      ballLight.addColorStop(1, "#cfcfc5");
-      ctx.fillStyle = ballLight;
+      ctx.fillStyle = "#ffffff";
       ctx.beginPath();
       ctx.arc(ground.x, ballY, radius, 0, Math.PI * 2);
       ctx.fill();
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.12)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
       ctx.restore();
     }
 
@@ -773,59 +885,152 @@
 
       const cx = window.innerWidth * 0.5;
       const top = 54;
-      ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
-      ctx.font = "700 54px Arial, Helvetica, sans-serif";
-      ctx.fillText(String(state.score.player), cx - 68, top);
-      ctx.fillText(String(state.score.bot), cx + 68, top);
+      drawScoreNumber(String(gameState.score.player), cx - 70, top, gameState.scorePulseSide === "player");
+      drawScoreNumber(String(gameState.score.bot), cx + 70, top, gameState.scorePulseSide === "bot");
 
       ctx.fillStyle = "rgba(255, 255, 255, 0.42)";
-      ctx.font = "700 30px Arial, Helvetica, sans-serif";
+      ctx.shadowColor = "rgba(0, 0, 0, 0.42)";
+      ctx.shadowBlur = 8;
+      ctx.font = "900 30px Nunito, Arial, Helvetica, sans-serif";
       ctx.fillText("-", cx, top - 2);
+      ctx.shadowBlur = 0;
 
       ctx.fillStyle = "rgba(255, 255, 255, 0.58)";
-      ctx.font = "700 11px Arial, Helvetica, sans-serif";
+      ctx.font = "800 11px Nunito, Arial, Helvetica, sans-serif";
       ctx.fillText("PLAYER", cx - 68, top + 38);
       ctx.fillText("BOT", cx + 68, top + 38);
 
       ctx.fillStyle = "rgba(255, 255, 255, 0.86)";
-      ctx.font = "600 13px Arial, Helvetica, sans-serif";
-      if (!state.handReady && state.mode === "playing") {
+      ctx.font = "800 13px Nunito, Arial, Helvetica, sans-serif";
+      if (!gameState.handReady && gameState.mode === "playing") {
         ctx.fillText("Show your right hand to control the paddle", cx, 112);
-      } else if (state.handReady && performance.now() - state.handSeenAt > 700) {
+      } else if (gameState.handReady && performance.now() - gameState.handSeenAt > 700) {
         ctx.fillText("Right hand lost", cx, 112);
-      } else if (state.phase === "player-serve") {
+      } else if (gameState.phase === "player-serve") {
         ctx.fillText("Swing forward to serve", cx, 112);
-      } else if (state.phase === "bot-serve") {
+      } else if (gameState.phase === "bot-serve") {
         ctx.fillText("Bot serving", cx, 112);
       }
 
       ctx.globalAlpha = 0.7;
-      ctx.fillText(`Rally ${state.rally}`, cx, window.innerHeight - 32);
+      ctx.fillText(`Rally ${gameState.rally}`, cx, window.innerHeight - 32);
+      ctx.restore();
+    }
+
+    function drawScoreNumber(text, x, y, isPulsing) {
+      const elapsed = performance.now() - gameState.scorePulseStartedAt;
+      const active = isPulsing && elapsed >= 0 && elapsed < 260;
+      const t = active ? elapsed / 260 : 1;
+      const scale = active ? 1 + Math.sin(t * Math.PI) * 0.22 : 1;
+      const lift = active ? -Math.sin(t * Math.PI) * 8 : 0;
+
+      ctx.save();
+      ctx.translate(x, y + lift);
+      ctx.scale(scale, scale);
+      ctx.fillStyle = "#ffffff";
+      ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
+      ctx.shadowBlur = 9;
+      ctx.shadowOffsetY = 3;
+      ctx.font = "900 56px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText(text, 0, 0);
       ctx.restore();
     }
 
     function drawGameOver() {
-      if (state.phase !== "game-over") {
+      if (gameState.phase !== "game-over") {
         return;
       }
 
+      const fade = clamp((performance.now() - gameState.gameOverStartedAt) / 320, 0, 1);
+      const cx = window.innerWidth * 0.5;
+      const cy = window.innerHeight * 0.5;
+      const cardW = Math.min(430, window.innerWidth - 48);
+      const cardH = 252;
+      const cardX = cx - cardW * 0.5;
+      const cardY = cy - cardH * 0.5;
+      const buttonW = 178;
+      const buttonH = 48;
+      const buttonX = cx - buttonW * 0.5;
+      const buttonY = cardY + cardH - 72;
+
+      gameState.playAgainButton = { x: buttonX, y: buttonY, w: buttonW, h: buttonH };
+
       ctx.save();
-      ctx.fillStyle = "rgba(13, 13, 13, 0.72)";
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = "rgba(10, 10, 18, 0.72)";
       ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+      ctx.shadowColor = "rgba(0, 0, 0, 0.42)";
+      ctx.shadowBlur = 22;
+      ctx.shadowOffsetY = 12;
+      ctx.fillStyle = "rgba(248, 251, 255, 0.96)";
+      roundedRect(cardX, cardY, cardW, cardH, 30);
+      ctx.fill();
+
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetY = 0;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillStyle = "#f7f7f2";
-      ctx.font = "800 64px Arial, Helvetica, sans-serif";
-      ctx.fillText(state.winner === "player" ? "YOU WIN" : "YOU LOSE", window.innerWidth * 0.5, window.innerHeight * 0.46);
-      ctx.fillStyle = "rgba(247, 247, 242, 0.72)";
-      ctx.font = "700 20px Arial, Helvetica, sans-serif";
-      ctx.fillText(`${state.score.player} - ${state.score.bot}`, window.innerWidth * 0.5, window.innerHeight * 0.56);
+      ctx.fillStyle = gameState.winner === "player" ? "#2f72d2" : "#5d667a";
+      ctx.font = "900 58px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText(gameState.winner === "player" ? "YOU WIN" : "YOU LOSE", cx, cardY + 78);
+      ctx.fillStyle = "#242a33";
+      ctx.font = "900 24px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText(`${gameState.score.player} - ${gameState.score.bot}`, cx, cardY + 124);
+
+      ctx.fillStyle = "#2f72d2";
+      roundedRect(buttonX, buttonY, buttonW, buttonH, 24);
+      ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "900 20px Nunito, Arial, Helvetica, sans-serif";
+      ctx.fillText("Play Again", cx, buttonY + buttonH * 0.5 + 1);
       ctx.restore();
+    }
+
+    function resetMatch(now = performance.now()) {
+      gameState.score = { player: 0, bot: 0 };
+      gameState.server = "player";
+      gameState.pendingGameWinner = null;
+      gameState.winner = null;
+      gameState.gameOverStartedAt = 0;
+      gameState.scorePulseSide = null;
+      gameState.scorePulseStartedAt = -Infinity;
+      gameState.bot.history.length = 0;
+      gameState.bot.targetX = 0;
+      gameState.bot.aimBias = 0;
+      gameState.bot.hitAvailable = false;
+      startServe("player", now);
+    }
+
+    function handlePointerDown(event) {
+      ensureAudio();
+
+      if (gameState.phase !== "game-over") {
+        return;
+      }
+
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const button = gameState.playAgainButton;
+      const insideButton = x >= button.x && x <= button.x + button.w && y >= button.y && y <= button.y + button.h;
+
+      if (insideButton) {
+        resetMatch();
+      }
+    }
+
+    function handleKeyDown(event) {
+      ensureAudio();
+      if (gameState.phase === "game-over" && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        resetMatch();
+      }
     }
 
     function drawLoading() {
       ctx.save();
-      ctx.fillStyle = "#0d0d0d";
+      ctx.fillStyle = "#0a0a12";
       ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
       const cx = window.innerWidth * 0.5;
@@ -839,31 +1044,31 @@
       ctx.stroke();
 
       ctx.fillStyle = "#f7f7f2";
-      ctx.font = "600 18px Arial, Helvetica, sans-serif";
+      ctx.font = "900 18px Nunito, Arial, Helvetica, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(state.message, cx, cy + 24);
+      ctx.fillText(gameState.message, cx, cy + 24);
 
       ctx.fillStyle = "rgba(247, 247, 242, 0.64)";
-      ctx.font = "13px Arial, Helvetica, sans-serif";
+      ctx.font = "800 13px Nunito, Arial, Helvetica, sans-serif";
       ctx.fillText("Allow camera access when prompted", cx, cy + 52);
       ctx.restore();
     }
 
     function draw() {
       ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-      ctx.fillStyle = "#0d0d0d";
+      ctx.fillStyle = "#0a0a12";
       ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
-      if (state.mode !== "playing") {
+      if (gameState.mode !== "playing") {
         drawLoading();
         return;
       }
 
       drawTable();
-      drawPaddle(state.bot, "#bb3030", state.bot.flash, true);
+      drawPaddle(gameState.bot, true);
       drawBall(performance.now());
-      drawPaddle(state.player, "#2455d8", state.hitFlash, false);
+      drawPaddle(gameState.player, false);
       drawHud();
       drawGameOver();
     }
@@ -877,9 +1082,10 @@
     async function init() {
       resize();
       requestAnimationFrame(frame);
+      document.fonts?.load("900 56px Nunito").catch(() => {});
 
       try {
-        state.message = "Starting webcam";
+        gameState.message = "Starting webcam";
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "user",
@@ -894,9 +1100,9 @@
         });
         await video.play();
 
-        state.message = "Loading hand tracker";
+        gameState.message = "Loading hand tracker";
         const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
-        state.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        gameState.handLandmarker = await HandLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
             delegate: "GPU"
@@ -908,18 +1114,20 @@
           minTrackingConfidence: 0.5
         });
 
-        state.mode = "playing";
-        state.message = "";
-        startServe(state.server);
+        gameState.mode = "playing";
+        gameState.message = "";
+        startServe(gameState.server);
       } catch (error) {
         console.error(error);
-        state.mode = "error";
-        state.phase = "error";
-        state.message = "Camera or hand tracker failed to load";
+        gameState.mode = "error";
+        gameState.phase = "error";
+        gameState.message = "Camera or hand tracker failed to load";
       }
     }
 
     window.addEventListener("resize", resize);
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
     init();
   </script>
 </body>
