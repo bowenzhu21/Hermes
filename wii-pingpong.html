@@ -1,0 +1,926 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wii Ping Pong</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #0d0d0d;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #f7f7f2;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #0d0d0d;
+    }
+
+    video {
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <video id="webcam" autoplay muted playsinline></video>
+
+  <script type="module">
+    import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js";
+
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const video = document.getElementById("webcam");
+
+    const state = {
+      mode: "loading",
+      phase: "loading",
+      message: "Loading hand tracker",
+      dpr: 1,
+      time: performance.now(),
+      lastVideoTime: -1,
+      handLandmarker: null,
+      handReady: false,
+      handSeenAt: 0,
+      table: null,
+      rally: 0,
+      score: { player: 0, bot: 0 },
+      server: "player",
+      serveStartedAt: 0,
+      botServeAt: 0,
+      freezeUntil: 0,
+      pendingGameWinner: null,
+      winner: null,
+      hitFlash: 0,
+      netFlash: 0,
+      ballTrail: [],
+      player: {
+        x: 0,
+        z: 0.08,
+        targetX: 0,
+        targetZ: 0.08,
+        prevX: 0,
+        prevZ: 0.08,
+        vx: 0,
+        vz: 0,
+        radius: 58
+      },
+      bot: {
+        x: 0,
+        baseZ: 0.92,
+        z: 0.92,
+        targetX: 0,
+        radius: 52,
+        flash: 0,
+        history: [],
+        reactionDelay: 180,
+        lerpFactor: 0.08,
+        aimBias: 0,
+        hitAvailable: false,
+        nextHitAt: 0,
+        willMisAim: false,
+        swingStartedAt: -Infinity,
+        swingDuration: 240
+      },
+      ball: null
+    };
+
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const ease = (t) => t * t * (3 - 2 * t);
+    const randomRange = (min, max) => min + Math.random() * (max - min);
+
+    function resize() {
+      state.dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.floor(window.innerWidth * state.dpr);
+      canvas.height = Math.floor(window.innerHeight * state.dpr);
+      ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+      computeTable();
+    }
+
+    function computeTable() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const tableHeight = h * 0.7;
+      const cx = w * 0.5;
+      const topY = h * 0.5 - tableHeight * 0.5;
+      const bottomY = h * 0.5 + tableHeight * 0.5;
+      const topWidth = Math.min(w * 0.52, tableHeight * 0.78);
+      const bottomWidth = Math.min(w * 0.86, tableHeight * 1.18);
+
+      state.table = {
+        cx,
+        topY,
+        bottomY,
+        height: tableHeight,
+        topWidth,
+        bottomWidth,
+        topLeft: { x: cx - topWidth * 0.5, y: topY },
+        topRight: { x: cx + topWidth * 0.5, y: topY },
+        bottomRight: { x: cx + bottomWidth * 0.5, y: bottomY },
+        bottomLeft: { x: cx - bottomWidth * 0.5, y: bottomY }
+      };
+
+      if (!state.ball) {
+        prepareServeBall(state.server);
+      }
+    }
+
+    function tableWidthAt(z) {
+      return lerp(state.table.bottomWidth, state.table.topWidth, ease(clamp(z, 0, 1)));
+    }
+
+    function tableYAt(z) {
+      if (z < 0) {
+        return state.table.bottomY + Math.abs(z) * state.table.height * 0.34;
+      }
+      if (z > 1) {
+        return state.table.topY - (z - 1) * state.table.height * 0.34;
+      }
+      return lerp(state.table.bottomY, state.table.topY, ease(z));
+    }
+
+    function tablePoint(xNorm, z) {
+      const width = tableWidthAt(z);
+      return {
+        x: state.table.cx + xNorm * width * 0.5,
+        y: tableYAt(z)
+      };
+    }
+
+    function prepareServeBall(server) {
+      const servingPlayer = server === "player";
+      const paddle = servingPlayer ? state.player : state.bot;
+      state.ball = {
+        active: false,
+        x: paddle.x,
+        y: servingPlayer ? 24 : 26,
+        z: servingPlayer ? paddle.z : paddle.baseZ,
+        fromX: paddle.x,
+        toX: paddle.x,
+        fromZ: servingPlayer ? paddle.z : paddle.baseZ,
+        toZ: servingPlayer ? paddle.z : paddle.baseZ,
+        start: performance.now(),
+        duration: 1,
+        arc: 0,
+        spin: 0,
+        sideSpin: 0,
+        direction: servingPlayer ? 1 : -1,
+        hasBounced: false,
+        hitWindowOpen: false,
+        radius: 11
+      };
+      state.bot.hitAvailable = false;
+      state.ballTrail.length = 0;
+    }
+
+    function startServe(server, now = performance.now()) {
+      state.server = server;
+      state.phase = server === "player" ? "player-serve" : "bot-serve";
+      state.serveStartedAt = now;
+      state.botServeAt = now + 1500;
+      state.rally = 0;
+      state.netFlash = 0;
+      prepareServeBall(server);
+    }
+
+    function launchBall({ fromX, fromZ, toX, toZ, direction, power, spin, sideSpin }) {
+      const now = performance.now();
+      const speedBoost = Math.min(state.rally * 32, 260);
+      const powerBoost = clamp(power * 180, 0, 260);
+      const baseDuration = direction > 0 ? 1080 : 1030;
+      const distance = Math.abs(toZ - fromZ);
+
+      state.ball = {
+        active: true,
+        x: fromX,
+        y: 0,
+        z: fromZ,
+        fromX,
+        toX: clamp(toX, -0.88, 0.88),
+        fromZ,
+        toZ,
+        start: now,
+        duration: clamp((baseDuration - speedBoost - powerBoost) * distance / 0.84, 560, 1180),
+        arc: clamp(102 + power * 76 + Math.abs(spin) * 18, 92, 185),
+        spin: clamp(spin, -1.35, 1.35),
+        sideSpin: clamp(sideSpin, -0.8, 0.8),
+        direction,
+        hasBounced: false,
+        hitWindowOpen: true,
+        radius: 11
+      };
+      state.phase = "rally";
+      state.ballTrail.length = 0;
+      scheduleBotHit();
+    }
+
+    function scheduleBotHit() {
+      const ball = state.ball;
+      const bot = state.bot;
+
+      bot.hitAvailable = false;
+      if (!ball.active || ball.direction <= 0) {
+        bot.history.length = 0;
+        return;
+      }
+
+      const hitZ = 0.9;
+      const t = clamp((hitZ - ball.fromZ) / (ball.toZ - ball.fromZ), 0.12, 0.94);
+      bot.hitAvailable = true;
+      bot.nextHitAt = ball.start + ball.duration * t + randomRange(-30, 30);
+      bot.willMisAim = Math.random() < 0.15;
+      bot.aimBias = randomRange(-0.035, 0.035);
+      bot.history.length = 0;
+    }
+
+    function getBallPose(now) {
+      const ball = state.ball;
+      if (!ball.active) {
+        return {
+          t: 0,
+          x: ball.x,
+          z: ball.z,
+          y: ball.y,
+          lift: ball.y,
+          shadowScale: 1 - clamp(ball.y / 260, 0, 0.52)
+        };
+      }
+
+      const t = clamp((now - ball.start) / ball.duration, 0, 1);
+      const spinCurve = ball.sideSpin * Math.sin(t * Math.PI) * 0.16;
+      const x = lerp(ball.fromX, ball.toX, t) + spinCurve;
+      const z = lerp(ball.fromZ, ball.toZ, t);
+      const bounceZ = ball.direction > 0 ? 0.64 : 0.36;
+      const bounceT = clamp((bounceZ - ball.fromZ) / (ball.toZ - ball.fromZ), 0.22, 0.78);
+      let y;
+
+      if (t <= bounceT) {
+        const beforeBounce = t / bounceT;
+        const startHeight = 22;
+        y = (1 - beforeBounce) * startHeight + Math.sin(beforeBounce * Math.PI) * ball.arc;
+      } else {
+        const afterBounce = (t - bounceT) / (1 - bounceT);
+        const spinLift = ball.spin * 34 * afterBounce;
+        const endHeight = 24;
+        const bounceArc = ball.arc * lerp(0.46, 0.34, afterBounce) + spinLift;
+        y = Math.sin(afterBounce * Math.PI) * bounceArc + afterBounce * endHeight;
+      }
+
+      y = Math.max(0, y);
+
+      return {
+        t,
+        x,
+        z,
+        y,
+        lift: y,
+        shadowScale: 1 - clamp(y / 260, 0, 0.52)
+      };
+    }
+
+    function detectHand(now) {
+      if (!state.handLandmarker || video.readyState < 2 || video.currentTime === state.lastVideoTime) {
+        return;
+      }
+
+      state.lastVideoTime = video.currentTime;
+      const result = state.handLandmarker.detectForVideo(video, now);
+      if (!result.landmarks || result.landmarks.length === 0) {
+        return;
+      }
+
+      let handIndex = 0;
+      if (result.handednesses) {
+        const rightIndex = result.handednesses.findIndex((handedness) => {
+          const label = handedness?.[0]?.categoryName || handedness?.[0]?.displayName;
+          return label === "Right";
+        });
+        if (rightIndex !== -1) {
+          handIndex = rightIndex;
+        }
+      }
+
+      const landmarks = result.landmarks[handIndex];
+      const wrist = landmarks[0];
+      const middleBase = landmarks[9] || wrist;
+      const indexBase = landmarks[5] || middleBase;
+      const pinkyBase = landmarks[17] || middleBase;
+      const palmX = (wrist.x + middleBase.x + indexBase.x + pinkyBase.x) * 0.25;
+      const palmY = (wrist.y + middleBase.y + indexBase.y + pinkyBase.y) * 0.25;
+      const mirroredX = 1 - palmX;
+
+      state.player.targetX = clamp((mirroredX - 0.5) * 2.22, -0.92, 0.92);
+      state.player.targetZ = clamp(0.045 + (1 - palmY) * 0.19, 0.035, 0.235);
+      state.handReady = true;
+      state.handSeenAt = now;
+    }
+
+    function updatePlayer(dt) {
+      const player = state.player;
+      const oldX = player.x;
+      const oldZ = player.z;
+
+      player.x = lerp(player.x, player.targetX, 0.2);
+      player.z = lerp(player.z, player.targetZ, 0.2);
+      player.vx = (player.x - oldX) / Math.max(dt, 0.001);
+      player.vz = (player.z - oldZ) / Math.max(dt, 0.001);
+      player.prevX = oldX;
+      player.prevZ = oldZ;
+
+      state.hitFlash = Math.max(0, state.hitFlash - dt * 5.4);
+      state.bot.flash = Math.max(0, state.bot.flash - dt * 4.2);
+      state.netFlash = Math.max(0, state.netFlash - dt * 6);
+    }
+
+    function updateBot(dt, pose, now) {
+      const bot = state.bot;
+      const totalPoints = state.score.player + state.score.bot;
+      const difficultySteps = Math.floor(totalPoints / 5);
+      const swingAge = now - bot.swingStartedAt;
+      const swingAmount = swingAge < bot.swingDuration ? Math.sin((swingAge / bot.swingDuration) * Math.PI) : 0;
+
+      bot.lerpFactor = Math.min(0.15, 0.08 + difficultySteps * 0.012);
+      bot.z = bot.baseZ - swingAmount * 0.075;
+
+      if (state.phase === "rally" && state.ball.direction > 0) {
+        bot.history.push({ time: now, x: pose.x });
+        while (bot.history.length > 0 && now - bot.history[0].time > 900) {
+          bot.history.shift();
+        }
+
+        const delayedTime = now - bot.reactionDelay;
+        let observed = null;
+        for (const sample of bot.history) {
+          if (sample.time <= delayedTime) {
+            observed = sample;
+          } else {
+            break;
+          }
+        }
+
+        bot.targetX = observed ? clamp(observed.x + bot.aimBias, -0.78, 0.78) : bot.targetX;
+      } else if (state.phase === "bot-serve") {
+        bot.targetX = 0;
+      } else if (state.phase === "player-serve") {
+        bot.targetX = clamp(state.player.x * 0.18, -0.4, 0.4);
+      } else {
+        bot.targetX = lerp(bot.targetX, 0, 0.025);
+      }
+
+      bot.x = lerp(bot.x, bot.targetX, bot.lerpFactor);
+    }
+
+    function updateBall(now) {
+      const ball = state.ball;
+      const pose = getBallPose(now);
+
+      ball.x = pose.x;
+      ball.y = pose.y;
+      ball.z = pose.z;
+
+      if (!ball.hasBounced) {
+        const bounceZ = ball.direction > 0 ? 0.64 : 0.36;
+        const crossed = ball.direction > 0 ? pose.z >= bounceZ : pose.z <= bounceZ;
+        if (crossed) {
+          ball.hasBounced = true;
+          state.netFlash = 1;
+        }
+      }
+
+      if (ball.direction < 0 && ball.hitWindowOpen && pose.z < 0.15) {
+        const ballPoint = tablePoint(pose.x, pose.z);
+        const paddlePoint = tablePoint(state.player.x, state.player.z);
+        const distance = Math.hypot(ballPoint.x - paddlePoint.x, ballPoint.y - paddlePoint.y);
+
+        if (distance <= 80 && state.handReady && now - state.handSeenAt < 250) {
+          playerHit(pose);
+          return;
+        } else if (pose.z < 0.055) {
+          ball.hitWindowOpen = false;
+        }
+      }
+
+      if (ball.direction > 0 && state.bot.hitAvailable && now >= state.bot.nextHitAt && pose.z > 0.82) {
+        const ballPoint = tablePoint(pose.x, pose.z);
+        const paddlePoint = tablePoint(state.bot.x, state.bot.z);
+        const distance = Math.hypot(ballPoint.x - paddlePoint.x, ballPoint.y - paddlePoint.y);
+
+        state.bot.hitAvailable = false;
+        if (distance <= 92) {
+          botHit(pose);
+          return;
+        }
+      }
+
+      if (pose.t >= 1) {
+        if (ball.direction < 0) {
+          scorePoint("bot", now, pose);
+        } else {
+          scorePoint("player", now, pose);
+        }
+      }
+    }
+
+    function scorePoint(winner, now, pose) {
+      state.score[winner] += 1;
+      state.phase = "point-freeze";
+      state.freezeUntil = now + 200;
+      state.pendingGameWinner = getGameWinner();
+      state.server = state.server === "player" ? "bot" : "player";
+      state.bot.hitAvailable = false;
+
+      state.ball.active = false;
+      state.ball.x = pose.x;
+      state.ball.y = pose.y;
+      state.ball.z = pose.z;
+      state.ballTrail.length = 0;
+    }
+
+    function getGameWinner() {
+      const { player, bot } = state.score;
+      if (Math.max(player, bot) >= 11 && Math.abs(player - bot) >= 2) {
+        return player > bot ? "player" : "bot";
+      }
+      return null;
+    }
+
+    function finishPoint(now) {
+      if (state.pendingGameWinner) {
+        state.winner = state.pendingGameWinner;
+        state.phase = "game-over";
+        state.pendingGameWinner = null;
+        return;
+      }
+
+      startServe(state.server, now);
+    }
+
+    function updatePlayerServe(now) {
+      const player = state.player;
+      const handSpeed = Math.hypot(player.vx * 0.85, player.vz * 2.2);
+
+      state.ball.x = player.x;
+      state.ball.z = player.z;
+      state.ball.y = 24;
+      state.ball.fromX = player.x;
+      state.ball.fromZ = player.z;
+      state.ball.toX = player.x;
+      state.ball.toZ = player.z;
+
+      if (now - state.serveStartedAt < 250 || !state.handReady || now - state.handSeenAt > 300) {
+        return;
+      }
+
+      if (player.vz > 0.35 || (player.vz > 0.14 && handSpeed > 0.58)) {
+        state.rally = 0;
+        state.hitFlash = 1;
+        launchBall({
+          fromX: player.x,
+          fromZ: player.z,
+          toX: clamp(player.x + player.vx * 0.075, -0.74, 0.74),
+          toZ: 1.06,
+          direction: 1,
+          power: clamp(handSpeed, 0.2, 1.4),
+          spin: clamp(player.vz * 0.85, -0.6, 1.1),
+          sideSpin: clamp(player.vx * 0.08, -0.55, 0.55)
+        });
+      }
+    }
+
+    function updateBotServe(now) {
+      const elapsed = now - state.serveStartedAt;
+      const tossT = clamp(elapsed / 1500, 0, 1);
+      const tossLift = Math.sin(tossT * Math.PI) * 46;
+
+      state.ball.x = state.bot.x;
+      state.ball.z = state.bot.baseZ - 0.025;
+      state.ball.y = 24 + tossLift;
+      state.ball.fromX = state.ball.x;
+      state.ball.fromZ = state.ball.z;
+      state.ball.toX = state.ball.x;
+      state.ball.toZ = state.ball.z;
+
+      if (now >= state.botServeAt) {
+        state.bot.flash = 1;
+        state.bot.swingStartedAt = now;
+        launchBall({
+          fromX: state.bot.x,
+          fromZ: state.bot.baseZ - 0.025,
+          toX: clamp(state.player.x * 0.32 + randomRange(-0.12, 0.12), -0.65, 0.65),
+          toZ: -0.08,
+          direction: -1,
+          power: 0.22,
+          spin: randomRange(-0.18, 0.28),
+          sideSpin: randomRange(-0.18, 0.18)
+        });
+      }
+    }
+
+    function playerHit(pose) {
+      const player = state.player;
+      const handSpeed = Math.hypot(player.vx * 0.8, player.vz * 2.4);
+      const swipe = clamp(player.vx * 0.09, -0.55, 0.55);
+      const depthDrive = clamp(player.vz * 0.08, -0.04, 0.08);
+      const targetX = pose.x + swipe + player.x * 0.18;
+      const targetZ = 1.08 + depthDrive;
+      const spin = clamp(player.vz * 0.8 + handSpeed * 0.06, -1, 1.25);
+
+      state.rally += 1;
+      state.hitFlash = 1;
+      launchBall({
+        fromX: pose.x,
+        fromZ: pose.z,
+        toX: targetX,
+        toZ: targetZ,
+        direction: 1,
+        power: clamp(handSpeed, 0, 1.8),
+        spin,
+        sideSpin: clamp(player.vx * 0.1, -0.7, 0.7)
+      });
+    }
+
+    function botHit(pose) {
+      const bot = state.bot;
+      const miss = bot.willMisAim ? randomRange(-0.26, 0.26) : randomRange(-0.055, 0.055);
+      const returnAngle = clamp((bot.x - pose.x) * 0.36 + miss, -0.42, 0.42);
+      const targetX = clamp(state.player.x * 0.52 + returnAngle, -0.78, 0.78);
+      const targetZ = -0.08 - Math.random() * 0.035;
+
+      state.rally += 1;
+      bot.flash = 1;
+      bot.swingStartedAt = performance.now();
+      launchBall({
+        fromX: pose.x,
+        fromZ: pose.z,
+        toX: targetX,
+        toZ: targetZ,
+        direction: -1,
+        power: 0.46 + Math.random() * 0.24 + state.rally * 0.025,
+        spin: (Math.random() - 0.42) * 0.9,
+        sideSpin: returnAngle * 1.3
+      });
+    }
+
+    function update(now) {
+      const dt = Math.min((now - state.time) / 1000, 0.033);
+      state.time = now;
+
+      if (state.mode === "playing") {
+        detectHand(now);
+
+        if (state.phase === "point-freeze") {
+          if (now >= state.freezeUntil) {
+            finishPoint(now);
+          }
+          return;
+        }
+
+        updatePlayer(dt);
+        const pose = getBallPose(now);
+        updateBot(dt, pose, now);
+
+        if (state.phase === "game-over") {
+          return;
+        }
+
+        if (state.phase === "player-serve") {
+          updatePlayerServe(now);
+        } else if (state.phase === "bot-serve") {
+          updateBotServe(now);
+        } else if (state.phase === "rally") {
+          updateBall(now);
+        }
+      }
+    }
+
+    function drawTable() {
+      const table = state.table;
+
+      ctx.save();
+      ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
+      ctx.shadowBlur = 32;
+      ctx.shadowOffsetY = 22;
+      makeTablePath();
+      const felt = ctx.createLinearGradient(0, table.topY, 0, table.bottomY);
+      felt.addColorStop(0, "#1c7b46");
+      felt.addColorStop(0.45, "#16844b");
+      felt.addColorStop(1, "#0c6039");
+      ctx.fillStyle = felt;
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      makeTablePath();
+      ctx.clip();
+      ctx.globalAlpha = 0.1;
+      for (let i = 0; i < 18; i += 1) {
+        const z = i / 17;
+        const p1 = tablePoint(-1, z);
+        const p2 = tablePoint(1, z);
+        ctx.strokeStyle = i % 2 === 0 ? "#d7ffe6" : "#083c25";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      drawTableLine(-1, 0, -1, 1, 8);
+      drawTableLine(1, 0, 1, 1, 8);
+      drawTableLine(-1, 0, 1, 0, 8);
+      drawTableLine(-1, 1, 1, 1, 5);
+      drawTableLine(0, 0, 0, 1, 4);
+      drawTableLine(-1, 0.5, 1, 0.5, 5);
+
+      const netLeft = tablePoint(-1.03, 0.5);
+      const netRight = tablePoint(1.03, 0.5);
+      ctx.save();
+      ctx.strokeStyle = state.netFlash > 0 ? `rgba(255, 255, 255, ${0.55 + state.netFlash * 0.35})` : "rgba(235, 245, 238, 0.48)";
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(netLeft.x, netLeft.y - 8);
+      ctx.lineTo(netRight.x, netRight.y - 8);
+      ctx.stroke();
+      ctx.strokeStyle = "rgba(23, 31, 25, 0.78)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(netLeft.x, netLeft.y - 2);
+      ctx.lineTo(netRight.x, netRight.y - 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function makeTablePath() {
+      const table = state.table;
+      ctx.beginPath();
+      ctx.moveTo(table.topLeft.x, table.topLeft.y);
+      ctx.lineTo(table.topRight.x, table.topRight.y);
+      ctx.lineTo(table.bottomRight.x, table.bottomRight.y);
+      ctx.lineTo(table.bottomLeft.x, table.bottomLeft.y);
+      ctx.closePath();
+    }
+
+    function drawTableLine(x1, z1, x2, z2, width) {
+      const a = tablePoint(x1, z1);
+      const b = tablePoint(x2, z2);
+      ctx.save();
+      ctx.strokeStyle = "rgba(244, 250, 237, 0.9)";
+      ctx.lineWidth = width;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawPaddle(paddle, color, flash = 0, isBot = false) {
+      const point = tablePoint(paddle.x, paddle.z);
+      const width = isBot ? 76 : 88;
+      const height = isBot ? 24 : 30;
+
+      ctx.save();
+      ctx.translate(point.x, point.y);
+      ctx.scale(1, isBot ? 0.72 : 0.82);
+      ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
+      ctx.shadowBlur = 16;
+      ctx.shadowOffsetY = 10;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, width * 0.5, height * 0.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowColor = "transparent";
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.22)";
+      ctx.stroke();
+
+      if (flash > 0) {
+        ctx.globalAlpha = flash;
+        ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
+        ctx.beginPath();
+        ctx.ellipse(0, 0, width * 0.53, height * 0.55, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawBall(now) {
+      const pose = getBallPose(now);
+      const ground = tablePoint(pose.x, pose.z);
+      const ballY = ground.y - pose.lift;
+      const perspectiveScale = lerp(1.15, 0.74, clamp(pose.z, 0, 1));
+      const radius = state.ball.radius * perspectiveScale;
+
+      if (state.ball.active && state.phase === "rally") {
+        state.ballTrail.push({ x: ground.x, y: ballY, r: radius, age: 1 });
+        if (state.ballTrail.length > 8) {
+          state.ballTrail.shift();
+        }
+      }
+
+      ctx.save();
+      for (const mark of state.ballTrail) {
+        mark.age *= 0.76;
+        ctx.globalAlpha = mark.age * 0.18;
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(mark.x, mark.y, mark.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.globalAlpha = 0.34;
+      ctx.fillStyle = "#000000";
+      ctx.beginPath();
+      ctx.ellipse(ground.x, ground.y + 7, radius * 1.35 * pose.shadowScale, radius * 0.42 * pose.shadowScale, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.shadowColor = "rgba(255, 255, 255, 0.55)";
+      ctx.shadowBlur = 9;
+      const ballLight = ctx.createRadialGradient(ground.x - radius * 0.35, ballY - radius * 0.45, radius * 0.1, ground.x, ballY, radius);
+      ballLight.addColorStop(0, "#ffffff");
+      ballLight.addColorStop(0.58, "#f4f4ec");
+      ballLight.addColorStop(1, "#cfcfc5");
+      ctx.fillStyle = ballLight;
+      ctx.beginPath();
+      ctx.arc(ground.x, ballY, radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawHud() {
+      ctx.save();
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      const cx = window.innerWidth * 0.5;
+      const top = 54;
+      ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+      ctx.font = "700 54px Arial, Helvetica, sans-serif";
+      ctx.fillText(String(state.score.player), cx - 68, top);
+      ctx.fillText(String(state.score.bot), cx + 68, top);
+
+      ctx.fillStyle = "rgba(255, 255, 255, 0.42)";
+      ctx.font = "700 30px Arial, Helvetica, sans-serif";
+      ctx.fillText("-", cx, top - 2);
+
+      ctx.fillStyle = "rgba(255, 255, 255, 0.58)";
+      ctx.font = "700 11px Arial, Helvetica, sans-serif";
+      ctx.fillText("PLAYER", cx - 68, top + 38);
+      ctx.fillText("BOT", cx + 68, top + 38);
+
+      ctx.fillStyle = "rgba(255, 255, 255, 0.86)";
+      ctx.font = "600 13px Arial, Helvetica, sans-serif";
+      if (!state.handReady && state.mode === "playing") {
+        ctx.fillText("Show your right hand to control the paddle", cx, 112);
+      } else if (state.handReady && performance.now() - state.handSeenAt > 700) {
+        ctx.fillText("Right hand lost", cx, 112);
+      } else if (state.phase === "player-serve") {
+        ctx.fillText("Swing forward to serve", cx, 112);
+      } else if (state.phase === "bot-serve") {
+        ctx.fillText("Bot serving", cx, 112);
+      }
+
+      ctx.globalAlpha = 0.7;
+      ctx.fillText(`Rally ${state.rally}`, cx, window.innerHeight - 32);
+      ctx.restore();
+    }
+
+    function drawGameOver() {
+      if (state.phase !== "game-over") {
+        return;
+      }
+
+      ctx.save();
+      ctx.fillStyle = "rgba(13, 13, 13, 0.72)";
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#f7f7f2";
+      ctx.font = "800 64px Arial, Helvetica, sans-serif";
+      ctx.fillText(state.winner === "player" ? "YOU WIN" : "YOU LOSE", window.innerWidth * 0.5, window.innerHeight * 0.46);
+      ctx.fillStyle = "rgba(247, 247, 242, 0.72)";
+      ctx.font = "700 20px Arial, Helvetica, sans-serif";
+      ctx.fillText(`${state.score.player} - ${state.score.bot}`, window.innerWidth * 0.5, window.innerHeight * 0.56);
+      ctx.restore();
+    }
+
+    function drawLoading() {
+      ctx.save();
+      ctx.fillStyle = "#0d0d0d";
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+      const cx = window.innerWidth * 0.5;
+      const cy = window.innerHeight * 0.5;
+      const pulse = 0.5 + Math.sin(performance.now() * 0.006) * 0.5;
+
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.22 + pulse * 0.42})`;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(cx, cy - 32, 24, -Math.PI * 0.5, Math.PI * (1.1 + pulse * 0.7));
+      ctx.stroke();
+
+      ctx.fillStyle = "#f7f7f2";
+      ctx.font = "600 18px Arial, Helvetica, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(state.message, cx, cy + 24);
+
+      ctx.fillStyle = "rgba(247, 247, 242, 0.64)";
+      ctx.font = "13px Arial, Helvetica, sans-serif";
+      ctx.fillText("Allow camera access when prompted", cx, cy + 52);
+      ctx.restore();
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      ctx.fillStyle = "#0d0d0d";
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+      if (state.mode !== "playing") {
+        drawLoading();
+        return;
+      }
+
+      drawTable();
+      drawPaddle(state.bot, "#bb3030", state.bot.flash, true);
+      drawBall(performance.now());
+      drawPaddle(state.player, "#2455d8", state.hitFlash, false);
+      drawHud();
+      drawGameOver();
+    }
+
+    function frame(now) {
+      update(now);
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    async function init() {
+      resize();
+      requestAnimationFrame(frame);
+
+      try {
+        state.message = "Starting webcam";
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 960 },
+            height: { ideal: 540 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        await new Promise((resolve) => {
+          video.onloadedmetadata = resolve;
+        });
+        await video.play();
+
+        state.message = "Loading hand tracker";
+        const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
+        state.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numHands: 2,
+          minHandDetectionConfidence: 0.55,
+          minHandPresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+
+        state.mode = "playing";
+        state.message = "";
+        startServe(state.server);
+      } catch (error) {
+        console.error(error);
+        state.mode = "error";
+        state.phase = "error";
+        state.message = "Camera or hand tracker failed to load";
+      }
+    }
+
+    window.addEventListener("resize", resize);
+    init();
+  </script>
+</body>
+</html>
