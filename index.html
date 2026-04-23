@@ -13,7 +13,7 @@
       height: 100%;
       margin: 0;
       overflow: hidden;
-      background: #0a0a12;
+      background: #0a0a12 url("assets/hermes.png") center / cover no-repeat;
       font-family: "Nunito", Arial, Helvetica, sans-serif;
       color: #f7f7f2;
     }
@@ -22,7 +22,7 @@
       display: block;
       width: 100vw;
       height: 100vh;
-      background: #0a0a12;
+      background: transparent;
     }
 
     video {
@@ -46,6 +46,8 @@
     const canvas = document.getElementById("game");
     const ctx = canvas.getContext("2d");
     const video = document.getElementById("webcam");
+    const backgroundImage = new Image();
+    backgroundImage.src = "assets/hermes.png";
 
     const gameState = {
       mode: "loading",
@@ -911,6 +913,26 @@
       return 1 + Math.sin(t * Math.PI) * amount;
     }
 
+    function drawBackground() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      if (backgroundImage.complete && backgroundImage.naturalWidth > 0) {
+        const scale = Math.max(w / backgroundImage.naturalWidth, h / backgroundImage.naturalHeight);
+        const imageW = backgroundImage.naturalWidth * scale;
+        const imageH = backgroundImage.naturalHeight * scale;
+        const imageX = (w - imageW) * 0.5;
+        const imageY = (h - imageH) * 0.5;
+        ctx.drawImage(backgroundImage, imageX, imageY, imageW, imageH);
+      } else {
+        ctx.fillStyle = "#0a0a12";
+        ctx.fillRect(0, 0, w, h);
+      }
+
+      ctx.fillStyle = "rgba(10, 10, 18, 0.32)";
+      ctx.fillRect(0, 0, w, h);
+    }
+
     function drawTable() {
       const table = gameState.table;
 
@@ -1386,8 +1408,7 @@
 
     function drawStartup() {
       ctx.save();
-      ctx.fillStyle = "#0a0a12";
-      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      drawBackground();
 
       const cx = window.innerWidth * 0.5;
       const cy = window.innerHeight * 0.5;
@@ -1483,14 +1504,13 @@
 
     function draw() {
       ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-      ctx.fillStyle = "#0a0a12";
-      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
       if (gameState.mode !== "playing") {
         drawStartup();
         return;
       }
 
+      drawBackground();
       const shake = getScreenShakeOffset();
       ctx.save();
       ctx.translate(shake.x, shake.y);
